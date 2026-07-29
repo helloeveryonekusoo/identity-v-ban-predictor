@@ -44,3 +44,5 @@ next-env.d.ts
 *.tsbuildinfo
 /.openai/dev.*.log
 /.openai/dev.pid
+/.openai/firebase-login.pid
+/firebase-debug.log
