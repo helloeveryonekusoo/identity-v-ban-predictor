@@ -39,6 +39,7 @@ yarn-error.log*
 next-env.d.ts
 /dist/
 /firebase-dist/
+/.firebase/
 /.wrangler/
 /outputs/
 /work/
