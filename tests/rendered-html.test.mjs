@@ -26,16 +26,18 @@ test("ships the BAN prediction product metadata", async () => {
   assert.doesNotMatch(layout, /codex-preview|Starter Project/);
 });
 
-test("includes Firebase sharing rules, authentication, and runtime configuration", async () => {
-  const [rules, route, firebaseConfig] = await Promise.all([
+test("includes Firebase sharing rules, authentication, and web configuration", async () => {
+  const [rules, webConfig, firebaseConfig, entry] = await Promise.all([
     readFile(new URL("firestore.rules", root), "utf8"),
-    readFile(new URL("app/api/firebase-config/route.ts", root), "utf8"),
+    readFile(new URL("public/firebase-config.json", root), "utf8"),
     readFile(new URL("firebase.json", root), "utf8"),
+    readFile(new URL("firebase-entry.tsx", root), "utf8"),
   ]);
 
   assert.match(rules, /match \/matches\/\{matchId\}/);
   assert.match(rules, /request\.auth/);
-  assert.match(route, /FIREBASE_PROJECT_ID/);
-  assert.match(route, /Cache-Control/);
+  assert.match(webConfig, /identity-v-ban-predictor-kuro/);
   assert.match(firebaseConfig, /"emailPassword": true/);
+  assert.match(firebaseConfig, /"public": "firebase-dist"/);
+  assert.match(entry, /<Home \/>/);
 });

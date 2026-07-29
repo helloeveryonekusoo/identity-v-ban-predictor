@@ -18,7 +18,7 @@ export type FirebaseServices = {
 };
 
 export async function loadFirebaseServices(): Promise<FirebaseServices | null> {
-  const response = await fetch("/api/firebase-config", { cache: "no-store" });
+  const response = await fetch("/firebase-config.json", { cache: "no-store" });
   if (!response.ok) return null;
   const config = (await response.json()) as FirebasePublicConfig | null;
   if (!config?.apiKey || !config.authDomain || !config.projectId || !config.appId) {

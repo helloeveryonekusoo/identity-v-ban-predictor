@@ -38,6 +38,7 @@ yarn-error.log*
 # typescript
 next-env.d.ts
 /dist/
+/firebase-dist/
 /.wrangler/
 /outputs/
 /work/

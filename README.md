@@ -2,6 +2,10 @@
 
 第五人格のランク戦で、マップとBANサバイバーからピックされる可能性の高いハンターを予測する共有Webアプリです。
 
+## 公開サイト
+
+**[第五人格 BAN Predictorを開く](https://identity-v-ban-predictor-kuro.web.app)**
+
 ## 主な機能
 
 - マップ選択時の先読みと、同一BAN構成の即時集計
