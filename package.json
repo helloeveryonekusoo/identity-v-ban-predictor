@@ -11,7 +11,8 @@
     "build:firebase": "vite build --config vite.firebase.config.ts",
     "start": "vinext start",
     "test": "npm run build && node --test \"tests/*.test.mjs\"",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "deploy": "npm run build:firebase && firebase deploy --only firestore:rules,hosting"
   },
   "dependencies": {
     "firebase": "^12.16.0",
@@ -30,6 +31,7 @@
     "@vitejs/plugin-rsc": "0.5.26",
     "eslint": "9.39.4",
     "eslint-config-next": "16.2.6",
+    "firebase-tools": "^15.25.0",
     "react-server-dom-webpack": "19.2.6",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
