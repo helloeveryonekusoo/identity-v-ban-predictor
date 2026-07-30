@@ -1,3 +1,10 @@
+import type {
+  AppSettings,
+  BanOrderMode,
+  MasterKind,
+  PredictionConfig,
+} from "./types";
+
 export const DEFAULT_MAPS = [
   "軍需工場",
   "赤の教会",
@@ -102,29 +109,233 @@ export const DEFAULT_HUNTERS = [
 
 export const BAN_NONE = "BANなし";
 
-export type AppSettings = {
-  maps: string[];
-  survivors: string[];
-  hunters: string[];
-  banSlots: number;
-  currentSeason: string;
+/** 集計画面の「全シーズン」を表す番兵値。シーズン名として使えない文字を含める。 */
+export const ALL_SEASONS = "__all__";
+
+/** 削除画面の「全ユーザー」を表す番兵値。 */
+export const ALL_USERS = "__all__";
+
+export const DEFAULT_SEASON = "現行シーズン";
+
+export const MASTER_LABELS: Record<MasterKind, string> = {
+  survivors: "サバイバー",
+  hunters: "ハンター",
+  maps: "マップ",
+  seasons: "シーズン",
 };
+
+/** シーズン補正の世代数（最新 / 1つ前 / 2つ前 / それ以前）。 */
+export const SEASON_AGE_BUCKETS = 4;
+
+export const MAX_BAN_SLOTS = 6;
+
+/** BAN一致数ごとの既定重み。index が一致数。銀行スロット数に合わせて伸縮させる。 */
+const DEFAULT_BAN_MATCH_WEIGHTS = [0, 3, 10, 30, 45, 60, 80];
+
+export const BAN_ORDER_LABELS: Record<BanOrderMode, string> = {
+  registered: "登録順",
+  banRate: "Ban率順",
+};
+
+export function defaultBanMatchWeights(banSlots: number): number[] {
+  return Array.from(
+    { length: banSlots + 1 },
+    (_, index) =>
+      DEFAULT_BAN_MATCH_WEIGHTS[index] ??
+      DEFAULT_BAN_MATCH_WEIGHTS[DEFAULT_BAN_MATCH_WEIGHTS.length - 1] +
+        15 * (index - DEFAULT_BAN_MATCH_WEIGHTS.length + 1),
+  );
+}
+
+export function defaultPredictionConfig(banSlots = 3): PredictionConfig {
+  return {
+    baseWeight: 1,
+    factors: {
+      banMatch: {
+        enabled: true,
+        params: {},
+        series: { weights: defaultBanMatchWeights(banSlots) },
+      },
+      // 既定値は「Ban3一致 > Ban2一致+マップ > Ban2一致 > Ban1一致+マップ」の
+      // 順になるよう、BAN一致数の重み差より小さい値にしてある。
+      mapMatch: {
+        enabled: true,
+        params: { weight: 6 },
+        series: {},
+      },
+      rareBan: {
+        enabled: true,
+        params: { maxBonus: 0.5 },
+        series: {},
+      },
+      season: {
+        enabled: true,
+        params: {},
+        series: { weights: [1, 0.8, 0.6, 0.4] },
+      },
+    },
+  };
+}
 
 export const DEFAULT_SETTINGS: AppSettings = {
   maps: [...DEFAULT_MAPS],
   survivors: [...DEFAULT_SURVIVORS],
   hunters: [...DEFAULT_HUNTERS],
+  seasons: [DEFAULT_SEASON],
   banSlots: 3,
-  currentSeason: "現行シーズン",
+  currentSeason: DEFAULT_SEASON,
+  banOrderMode: "registered",
+  prediction: defaultPredictionConfig(3),
 };
 
+function uniqueStrings(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback];
+  const cleaned = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  cleaned.forEach((item) => {
+    if (seen.has(item)) return;
+    seen.add(item);
+    result.push(item);
+  });
+  return result.length ? result : [...fallback];
+}
+
+function numberOr(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function numberSeries(
+  value: unknown,
+  length: number,
+  fallback: number[],
+): number[] {
+  const source = Array.isArray(value) ? value : [];
+  return Array.from({ length }, (_, index) =>
+    numberOr(source[index], fallback[index] ?? fallback[fallback.length - 1] ?? 0),
+  );
+}
+
+/**
+ * Firestore から読んだ生データを、常に完全な AppSettings へ整える。
+ * 旧バージョンのドキュメント（seasons や prediction を持たない）も安全に読める。
+ */
+export function normalizeSettings(raw: unknown): AppSettings {
+  const data = (raw ?? {}) as Partial<AppSettings> & Record<string, unknown>;
+
+  const banSlots = Math.min(
+    MAX_BAN_SLOTS,
+    Math.max(1, Math.round(numberOr(data.banSlots, DEFAULT_SETTINGS.banSlots))),
+  );
+  const currentSeason =
+    typeof data.currentSeason === "string" && data.currentSeason.trim()
+      ? data.currentSeason.trim()
+      : DEFAULT_SETTINGS.currentSeason;
+
+  const seasons = uniqueStrings(data.seasons, [currentSeason]);
+  // 現在シーズンは必ず一覧の先頭（＝最新）に存在させる。
+  const orderedSeasons = seasons.includes(currentSeason)
+    ? seasons
+    : [currentSeason, ...seasons];
+
+  const fallbackPrediction = defaultPredictionConfig(banSlots);
+  const rawPrediction = (data.prediction ?? {}) as Partial<PredictionConfig>;
+  const rawFactors = (rawPrediction.factors ?? {}) as Record<string, unknown>;
+
+  const factors: PredictionConfig["factors"] = {};
+  Object.entries(fallbackPrediction.factors).forEach(([id, fallback]) => {
+    const stored = (rawFactors[id] ?? {}) as Record<string, unknown>;
+    const storedParams = (stored.params ?? {}) as Record<string, unknown>;
+    const storedSeries = (stored.series ?? {}) as Record<string, unknown>;
+
+    factors[id] = {
+      enabled:
+        typeof stored.enabled === "boolean" ? stored.enabled : fallback.enabled,
+      params: Object.fromEntries(
+        Object.entries(fallback.params).map(([key, value]) => [
+          key,
+          numberOr(storedParams[key], value),
+        ]),
+      ),
+      series: Object.fromEntries(
+        Object.entries(fallback.series).map(([key, value]) => [
+          key,
+          numberSeries(storedSeries[key], value.length, value),
+        ]),
+      ),
+    };
+  });
+
+  // 未知のファクター設定も保持しておく（将来の要素追加・巻き戻しでデータを失わない）。
+  Object.entries(rawFactors).forEach(([id, value]) => {
+    if (factors[id] || !value || typeof value !== "object") return;
+    const stored = value as Record<string, unknown>;
+    factors[id] = {
+      enabled: stored.enabled !== false,
+      params: (stored.params ?? {}) as Record<string, number>,
+      series: (stored.series ?? {}) as Record<string, number[]>,
+    };
+  });
+
+  return {
+    maps: uniqueStrings(data.maps, DEFAULT_SETTINGS.maps),
+    survivors: uniqueStrings(data.survivors, DEFAULT_SETTINGS.survivors),
+    hunters: uniqueStrings(data.hunters, DEFAULT_SETTINGS.hunters),
+    seasons: orderedSeasons,
+    banSlots,
+    currentSeason,
+    banOrderMode:
+      data.banOrderMode === "banRate" ? "banRate" : "registered",
+    prediction: { baseWeight: numberOr(rawPrediction.baseWeight, 1), factors },
+  };
+}
+
+/** BAN人数を変えたときに、BAN一致数の重み配列を過不足なく合わせる。 */
+export function resizeBanMatchWeights(
+  settings: AppSettings,
+  banSlots: number,
+): AppSettings {
+  const fallback = defaultBanMatchWeights(banSlots);
+  const current = settings.prediction.factors.banMatch?.series.weights ?? [];
+  return {
+    ...settings,
+    banSlots,
+    prediction: {
+      ...settings.prediction,
+      factors: {
+        ...settings.prediction.factors,
+        banMatch: {
+          ...settings.prediction.factors.banMatch,
+          series: {
+            weights: fallback.map((value, index) =>
+              typeof current[index] === "number" ? current[index] : value,
+            ),
+          },
+        },
+      },
+    },
+  };
+}
+
 export const DEMO_MATCHES = [
-  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "イタカ"],
-  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "イタカ"],
-  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "女王蜂"],
-  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "雑貨商"],
-  ["赤の教会", "祭司", "傭兵", "占い師", "血の女王"],
-  ["赤の教会", "祭司", "傭兵", "占い師", "血の女王"],
-  ["赤の教会", "祭司", "傭兵", "占い師", "サングリア"],
-  ["永眠町", "空軍", BAN_NONE, BAN_NONE, "フラバルー"],
+  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "イタカ", "S43"],
+  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "イタカ", "S43"],
+  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "女王蜂", "S42"],
+  ["軍需工場", "機械技師", "オフェンス", BAN_NONE, "雑貨商", "S41"],
+  ["軍需工場", "祭司", "機械技師", "空軍", "イタカ", "S43"],
+  ["赤の教会", "祭司", "傭兵", "占い師", "血の女王", "S43"],
+  ["赤の教会", "祭司", "傭兵", "占い師", "血の女王", "S42"],
+  ["赤の教会", "祭司", "傭兵", "占い師", "サングリア", "S41"],
+  ["赤の教会", "機械技師", "傭兵", "占い師", "アイヴィ", "S43"],
+  ["永眠町", "空軍", BAN_NONE, BAN_NONE, "フラバルー", "S43"],
+  ["永眠町", "機械技師", "オフェンス", "祭司", "破輪", "S42"],
+  ["聖心病院", "機械技師", "脱出マスター", "幻灯師", "蝋人形師", "S43"],
+  ["聖心病院", "機械技師", "脱出マスター", "幻灯師", "蝋人形師", "S43"],
+  ["聖心病院", "機械技師", "オフェンス", "呪術師", "歯医者", "S42"],
+  ["月の河公園", "機械技師", "脱出マスター", "幻灯師", "心の獣", "S43"],
+  ["湖景村", "祭司", "空軍", "機械技師", "漁師", "S41"],
 ] as const;
+
+export const DEMO_SEASONS = ["S43", "S42", "S41"];

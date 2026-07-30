@@ -13,8 +13,8 @@ service cloud.firestore {
     }
 
     match /matches/{matchId} {
-      allow read, create, delete: if signedIn();
-      allow update: if false;
+      // update はマスターデータの名称変更を過去データへ反映するために必要。
+      allow read, create, update, delete: if signedIn();
     }
 
     match /settings/global {

@@ -20,37 +20,87 @@ import {
   setDoc,
   where,
   writeBatch,
+  type Firestore,
 } from "firebase/firestore";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ALL_SEASONS,
+  ALL_USERS,
   BAN_NONE,
+  BAN_ORDER_LABELS,
   DEFAULT_SETTINGS,
   DEMO_MATCHES,
-  type AppSettings,
+  DEMO_SEASONS,
+  MASTER_LABELS,
+  MAX_BAN_SLOTS,
+  defaultPredictionConfig,
+  normalizeSettings,
+  resizeBanMatchWeights,
 } from "./constants";
 import { loadFirebaseServices, type FirebaseServices } from "./firebase";
-import { buildPrediction, normalizeBans } from "./prediction";
-import type { MatchRecord, PredictionResult, ViewName } from "./types";
+import { PREDICTION_FACTORS, buildPrediction } from "./prediction";
+import {
+  activeRenames,
+  applyRenamesToRecords,
+  chunk,
+  emptyRenamePlan,
+  hasRenames,
+  planRename,
+  renameCount,
+  renameFieldsForRecord,
+} from "./records";
+import {
+  buildBanRanking,
+  buildBanRateIndex,
+  buildHunterRanking,
+  buildMapHunterStats,
+  collectRegistrants,
+  collectSeasons,
+  filterBySeason,
+  normalizeBans,
+  orderSurvivors,
+} from "./stats";
+import type {
+  AppSettings,
+  BanOrderMode,
+  FactorConfig,
+  MasterKind,
+  MatchRecord,
+  PredictionResult,
+  RankingResult,
+  RenamePlan,
+  ViewName,
+} from "./types";
+
+const RECORD_LIMIT = 5000;
 
 const emptyPrediction: PredictionResult = {
   rows: [],
   total: 0,
-  basis: "none",
+  exactCount: 0,
+  basis: "",
+  tiers: [],
 };
 
 const demoRecords: MatchRecord[] = DEMO_MATCHES.map((row, index) => ({
   id: `demo-${index + 1}`,
-  registeredAt: new Date(Date.now() - (DEMO_MATCHES.length - index) * 86400000),
-  registeredByUid: "demo",
-  registeredByName: "デモユーザー",
+  registeredAt: new Date(Date.now() - (DEMO_MATCHES.length - index) * 3600000),
+  registeredByUid: index % 2 ? "demo-b" : "demo-a",
+  registeredByName: index % 2 ? "デモユーザーB" : "デモユーザーA",
   map: row[0],
   bans: [row[1], row[2], row[3]],
   ban1: row[1],
   ban2: row[2],
   ban3: row[3],
   hunter: row[4],
-  season: "デモシーズン",
+  season: row[5],
 }));
+
+const demoSettings: AppSettings = normalizeSettings({
+  ...DEFAULT_SETTINGS,
+  seasons: DEMO_SEASONS,
+  currentSeason: DEMO_SEASONS[0],
+});
 
 function toDate(value: MatchRecord["registeredAt"]) {
   if (!value) return null;
@@ -94,6 +144,49 @@ function recordFromDoc(
   };
 }
 
+/**
+ * 名称変更の対象データを集める。
+ * ローカルに読み込み済みのデータに加え、変更前の名称でFirestoreを直接検索し、
+ * 未読み込みのデータも取りこぼさないようにする。
+ */
+async function collectRenameTargets(
+  db: Firestore,
+  plan: RenamePlan,
+  localRecords: MatchRecord[],
+) {
+  const targets = new Map<string, MatchRecord>();
+  localRecords.forEach((record) => {
+    if (renameFieldsForRecord(record, plan)) targets.set(record.id, record);
+  });
+
+  const lookups: { field: string; op: "==" | "array-contains"; value: string }[] =
+    [];
+  activeRenames(plan, "survivors").forEach(([from]) =>
+    lookups.push({ field: "bans", op: "array-contains", value: from }),
+  );
+  activeRenames(plan, "maps").forEach(([from]) =>
+    lookups.push({ field: "map", op: "==", value: from }),
+  );
+  activeRenames(plan, "hunters").forEach(([from]) =>
+    lookups.push({ field: "hunter", op: "==", value: from }),
+  );
+  activeRenames(plan, "seasons").forEach(([from]) =>
+    lookups.push({ field: "season", op: "==", value: from }),
+  );
+
+  for (const lookup of lookups) {
+    const snapshots = await getDocs(
+      query(collection(db, "matches"), where(lookup.field, lookup.op, lookup.value)),
+    );
+    snapshots.docs.forEach((snapshot) => {
+      const record = recordFromDoc(snapshot);
+      if (renameFieldsForRecord(record, plan)) targets.set(record.id, record);
+    });
+  }
+
+  return [...targets.values()];
+}
+
 export default function Home() {
   const [services, setServices] = useState<FirebaseServices | null>(null);
   const [firebaseChecked, setFirebaseChecked] = useState(false);
@@ -101,6 +194,11 @@ export default function Home() {
   const [demoMode, setDemoMode] = useState(false);
   const [view, setView] = useState<ViewName>("main");
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+
+  const [allRecords, setAllRecords] = useState<MatchRecord[]>([]);
+  const [recordsLoaded, setRecordsLoaded] = useState(false);
+  const [loadingRecords, setLoadingRecords] = useState(false);
+
   const [selectedMap, setSelectedMap] = useState("");
   const [bans, setBans] = useState<string[]>(
     Array(DEFAULT_SETTINGS.banSlots).fill(BAN_NONE),
@@ -109,16 +207,14 @@ export default function Home() {
   const [prediction, setPrediction] =
     useState<PredictionResult>(emptyPrediction);
   const [hasSearched, setHasSearched] = useState(false);
-  const [mapRecords, setMapRecords] = useState<MatchRecord[]>([]);
-  const [demoAdded, setDemoAdded] = useState<MatchRecord[]>([]);
-  const [loadingMap, setLoadingMap] = useState(false);
+
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState("");
-  const [recentRecords, setRecentRecords] = useState<MatchRecord[]>([]);
+
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteDate, setDeleteDate] = useState("");
   const [deleteTime, setDeleteTime] = useState("");
-  const cacheRef = useRef<Map<string, MatchRecord[]>>(new Map());
+  const [deleteUser, setDeleteUser] = useState(ALL_USERS);
 
   const signedIn = Boolean(user || demoMode);
   const displayName =
@@ -142,36 +238,43 @@ export default function Home() {
     return () => unsubscribe();
   }, []);
 
+  const loadRecords = useCallback(async () => {
+    if (!services) return;
+    setLoadingRecords(true);
+    try {
+      const snapshots = await getDocs(
+        query(
+          collection(services.db, "matches"),
+          orderBy("registeredAt", "desc"),
+          limit(RECORD_LIMIT),
+        ),
+      );
+      setAllRecords(snapshots.docs.map(recordFromDoc));
+      setRecordsLoaded(true);
+    } catch {
+      notify("共有データを取得できませんでした");
+    } finally {
+      setLoadingRecords(false);
+    }
+  }, [notify, services]);
+
   useEffect(() => {
     if (!signedIn) return;
     if (demoMode || !services) {
-      queueMicrotask(() => setSettings(DEFAULT_SETTINGS));
+      queueMicrotask(() => {
+        setSettings(demoSettings);
+        setAllRecords(demoRecords);
+        setRecordsLoaded(true);
+      });
       return;
     }
     getDoc(doc(services.db, "settings", "global"))
       .then((snapshot) => {
-        if (!snapshot.exists()) return;
-        const data = snapshot.data() as Partial<AppSettings>;
-        setSettings({
-          maps: Array.isArray(data.maps) ? data.maps : DEFAULT_SETTINGS.maps,
-          survivors: Array.isArray(data.survivors)
-            ? data.survivors
-            : DEFAULT_SETTINGS.survivors,
-          hunters: Array.isArray(data.hunters)
-            ? data.hunters
-            : DEFAULT_SETTINGS.hunters,
-          banSlots:
-            typeof data.banSlots === "number"
-              ? Math.min(6, Math.max(1, data.banSlots))
-              : DEFAULT_SETTINGS.banSlots,
-          currentSeason:
-            typeof data.currentSeason === "string"
-              ? data.currentSeason
-              : DEFAULT_SETTINGS.currentSeason,
-        });
+        if (snapshot.exists()) setSettings(normalizeSettings(snapshot.data()));
       })
       .catch(() => notify("設定の読み込みに失敗しました"));
-  }, [demoMode, notify, services, signedIn]);
+    queueMicrotask(() => void loadRecords());
+  }, [demoMode, loadRecords, notify, services, signedIn]);
 
   useEffect(() => {
     queueMicrotask(() =>
@@ -184,58 +287,41 @@ export default function Home() {
     );
   }, [settings.banSlots]);
 
-  const fetchMapRecords = useCallback(
-    async (map: string, force = false) => {
-      if (!map) return [];
-      if (demoMode || !services) {
-        const records = [...demoRecords, ...demoAdded].filter(
-          (record) => record.map === map,
-        );
-        setMapRecords(records);
-        return records;
-      }
-      if (!force && cacheRef.current.has(map)) {
-        const cached = cacheRef.current.get(map) ?? [];
-        setMapRecords(cached);
-        return cached;
-      }
-      setLoadingMap(true);
-      try {
-        const snapshots = await getDocs(
-          query(
-            collection(services.db, "matches"),
-            where("map", "==", map),
-            limit(5000),
-          ),
-        );
-        const records = snapshots.docs.map(recordFromDoc);
-        cacheRef.current.set(map, records);
-        setMapRecords(records);
-        return records;
-      } catch {
-        notify("共有データを取得できませんでした");
-        return [];
-      } finally {
-        setLoadingMap(false);
-      }
-    },
-    [demoAdded, demoMode, notify, services],
+  const banRateIndex = useMemo(() => buildBanRateIndex(allRecords), [allRecords]);
+
+  const survivorOptions = useMemo(
+    () => orderSurvivors(settings.survivors, settings.banOrderMode, banRateIndex),
+    [banRateIndex, settings.banOrderMode, settings.survivors],
   );
 
-  const chooseMap = (map: string) => {
-    setSelectedMap(map);
-    setHasSearched(false);
-    setPrediction(emptyPrediction);
-    setActualHunter("");
-    void fetchMapRecords(map);
-  };
+  const seasonOptions = useMemo(
+    () => collectSeasons(allRecords, settings.seasons),
+    [allRecords, settings.seasons],
+  );
+
+  const registrants = useMemo(() => collectRegistrants(allRecords), [allRecords]);
+
+  const mapRecordCount = useMemo(
+    () =>
+      selectedMap
+        ? allRecords.filter((record) => record.map === selectedMap).length
+        : 0,
+    [allRecords, selectedMap],
+  );
 
   const duplicateBan = useMemo(() => {
     const active = bans.filter((ban) => ban !== BAN_NONE);
     return new Set(active).size !== active.length;
   }, [bans]);
 
-  const runPrediction = async () => {
+  const chooseMap = (map: string) => {
+    setSelectedMap(map);
+    setHasSearched(false);
+    setPrediction(emptyPrediction);
+    setActualHunter("");
+  };
+
+  const runPrediction = () => {
     if (!selectedMap) {
       notify("マップを選択してください");
       return;
@@ -244,11 +330,14 @@ export default function Home() {
       notify("同じサバイバーは複数選択できません");
       return;
     }
-    const records =
-      mapRecords.length || cacheRef.current.has(selectedMap)
-        ? mapRecords
-        : await fetchMapRecords(selectedMap);
-    setPrediction(buildPrediction(records, selectedMap, bans));
+    setPrediction(
+      buildPrediction(
+        allRecords,
+        { map: selectedMap, bans, season: settings.currentSeason },
+        settings,
+        banRateIndex,
+      ),
+    );
     setHasSearched(true);
   };
 
@@ -267,38 +356,46 @@ export default function Home() {
       { length: Math.max(3, settings.banSlots) },
       (_, index) => selectedBans[index] ?? BAN_NONE,
     );
+    const payload = {
+      map,
+      bans: padded.slice(0, settings.banSlots),
+      ban1: padded[0],
+      ban2: padded[1],
+      ban3: padded[2],
+      hunter,
+      season: settings.currentSeason,
+    };
     setBusy(true);
     try {
-      if (demoMode || !services) {
-        const newRecord: MatchRecord = {
-          id: `demo-added-${Date.now()}`,
-          registeredAt: new Date(),
-          registeredByUid: "demo",
-          registeredByName: "デモユーザー",
-          map,
-          bans: padded.slice(0, settings.banSlots),
-          ban1: padded[0],
-          ban2: padded[1],
-          ban3: padded[2],
-          hunter,
-          season: settings.currentSeason,
-        };
-        setDemoAdded((current) => [...current, newRecord]);
-      } else if (user) {
+      if (demoMode || !services || !user) {
+        setAllRecords((records) => [
+          {
+            id: `local-${Date.now()}`,
+            registeredAt: new Date(),
+            registeredByUid: "demo",
+            registeredByName: "デモユーザー",
+            ...payload,
+          },
+          ...records,
+        ]);
+      } else {
         const matchRef = doc(collection(services.db, "matches"));
         await setDoc(matchRef, {
           registeredAt: serverTimestamp(),
           registeredByUid: user.uid,
           registeredByName: displayName,
-          map,
-          bans: padded.slice(0, settings.banSlots),
-          ban1: padded[0],
-          ban2: padded[1],
-          ban3: padded[2],
-          hunter,
-          season: settings.currentSeason,
+          ...payload,
         });
-        cacheRef.current.delete(map);
+        setAllRecords((records) => [
+          {
+            id: matchRef.id,
+            registeredAt: new Date(),
+            registeredByUid: user.uid,
+            registeredByName: displayName,
+            ...payload,
+          },
+          ...records,
+        ]);
       }
       notify("試合データを登録しました");
       return true;
@@ -321,57 +418,29 @@ export default function Home() {
       setActualHunter("");
       setPrediction(emptyPrediction);
       setHasSearched(false);
-      setMapRecords([]);
     }
   };
 
-  const loadRecentRecords = useCallback(async () => {
-    if (demoMode || !services) {
-      setRecentRecords(
-        [...demoRecords, ...demoAdded].sort(
-          (a, b) =>
-            (toDate(a.registeredAt)?.getTime() ?? 0) -
-            (toDate(b.registeredAt)?.getTime() ?? 0),
-        ),
-      );
-      return;
-    }
-    setBusy(true);
-    try {
-      const snapshots = await getDocs(
-        query(
-          collection(services.db, "matches"),
-          orderBy("registeredAt", "desc"),
-          limit(500),
-        ),
-      );
-      setRecentRecords(
-        snapshots.docs
-          .map(recordFromDoc)
-          .sort(
-            (a, b) =>
-              (toDate(a.registeredAt)?.getTime() ?? 0) -
-              (toDate(b.registeredAt)?.getTime() ?? 0),
-          ),
-      );
-    } catch {
-      notify("登録データを取得できませんでした");
-    } finally {
-      setBusy(false);
-    }
-  }, [demoAdded, demoMode, notify, services]);
-
-  useEffect(() => {
-    if (view === "delete" && signedIn) {
-      queueMicrotask(() => void loadRecentRecords());
-    }
-  }, [loadRecentRecords, signedIn, view]);
+  const sortedRecords = useMemo(
+    () =>
+      [...allRecords].sort(
+        (a, b) =>
+          (toDate(b.registeredAt)?.getTime() ?? 0) -
+          (toDate(a.registeredAt)?.getTime() ?? 0),
+      ),
+    [allRecords],
+  );
 
   const filteredRecords = useMemo(
     () =>
-      recentRecords.filter((record) => {
+      sortedRecords.filter((record) => {
+        if (deleteUser !== ALL_USERS) {
+          const key = record.registeredByUid || record.registeredByName;
+          if (key !== deleteUser) return false;
+        }
+        if (!deleteDate && !deleteTime) return true;
         const date = toDate(record.registeredAt);
-        if (!date) return !deleteDate && !deleteTime;
+        if (!date) return false;
         const localDate = [
           date.getFullYear(),
           String(date.getMonth() + 1).padStart(2, "0"),
@@ -385,7 +454,7 @@ export default function Home() {
           (!deleteTime || localTime === deleteTime)
         );
       }),
-    [deleteDate, deleteTime, recentRecords],
+    [deleteDate, deleteTime, deleteUser, sortedRecords],
   );
 
   const deleteSelected = async () => {
@@ -396,19 +465,14 @@ export default function Home() {
     if (!window.confirm(`${selectedIds.size}件のデータを削除しますか？`)) return;
     setBusy(true);
     try {
-      if (demoMode || !services) {
-        setDemoAdded((records) =>
-          records.filter((record) => !selectedIds.has(record.id)),
-        );
-      } else {
-        const batch = writeBatch(services.db);
-        selectedIds.forEach((id) =>
-          batch.delete(doc(services.db, "matches", id)),
-        );
-        await batch.commit();
-        cacheRef.current.clear();
+      if (!demoMode && services) {
+        for (const group of chunk([...selectedIds])) {
+          const batch = writeBatch(services.db);
+          group.forEach((id) => batch.delete(doc(services.db, "matches", id)));
+          await batch.commit();
+        }
       }
-      setRecentRecords((records) =>
+      setAllRecords((records) =>
         records.filter((record) => !selectedIds.has(record.id)),
       );
       notify(`${selectedIds.size}件を削除しました`);
@@ -420,18 +484,44 @@ export default function Home() {
     }
   };
 
-  const saveSettings = async (next: AppSettings) => {
+  const saveSettings = async (next: AppSettings, plan: RenamePlan) => {
+    const normalized = normalizeSettings(next);
+    const renames = renameCount(plan);
     setBusy(true);
     try {
       if (!demoMode && services) {
-        await setDoc(doc(services.db, "settings", "global"), next);
+        if (hasRenames(plan)) {
+          const targets = await collectRenameTargets(services.db, plan, allRecords);
+          for (const group of chunk(targets)) {
+            const batch = writeBatch(services.db);
+            group.forEach((record) => {
+              const changes = renameFieldsForRecord(record, plan);
+              if (changes) {
+                batch.update(
+                  doc(services.db, "matches", record.id),
+                  changes as Record<string, unknown>,
+                );
+              }
+            });
+            await batch.commit();
+          }
+        }
+        await setDoc(doc(services.db, "settings", "global"), normalized);
       }
-      setSettings(next);
-      cacheRef.current.clear();
-      notify("システム設定を更新しました");
+      setAllRecords((records) => applyRenamesToRecords(records, plan));
+      setSettings(normalized);
+      setPrediction(emptyPrediction);
+      setHasSearched(false);
+      notify(
+        renames
+          ? `設定を更新し、${renames}件の名称を登録データへ反映しました`
+          : "システム設定を更新しました",
+      );
       setView("main");
+      return true;
     } catch {
       notify("設定の更新に失敗しました");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -442,6 +532,8 @@ export default function Home() {
     setDemoMode(false);
     setView("main");
     setUser(null);
+    setAllRecords([]);
+    setRecordsLoaded(false);
   };
 
   if (!firebaseChecked) {
@@ -474,6 +566,7 @@ export default function Home() {
         <div className="header-status">
           <span className="live-dot" />
           <span>{settings.currentSeason}</span>
+          <span className="header-count">{allRecords.length}件</span>
           {demoMode && <span className="demo-badge">DEMO</span>}
         </div>
         <div className="account">
@@ -489,13 +582,15 @@ export default function Home() {
         {view === "main" && (
           <MainView
             settings={settings}
+            survivorOptions={survivorOptions}
             selectedMap={selectedMap}
             chooseMap={chooseMap}
             bans={bans}
             setBans={setBans}
             duplicateBan={duplicateBan}
-            loadingMap={loadingMap}
-            mapRecords={mapRecords}
+            loadingRecords={loadingRecords}
+            totalRecords={allRecords.length}
+            mapRecordCount={mapRecordCount}
             runPrediction={runPrediction}
             prediction={prediction}
             hasSearched={hasSearched}
@@ -505,9 +600,18 @@ export default function Home() {
             busy={busy}
           />
         )}
+        {view === "stats" && (
+          <StatsView
+            records={allRecords}
+            seasons={seasonOptions}
+            loading={loadingRecords || !recordsLoaded}
+            onBack={() => setView("main")}
+          />
+        )}
         {view === "add" && (
           <AddView
             settings={settings}
+            survivorOptions={survivorOptions}
             busy={busy}
             onSave={saveMatch}
             onBack={() => setView("main")}
@@ -516,12 +620,15 @@ export default function Home() {
         {view === "delete" && (
           <DeleteView
             records={filteredRecords}
+            registrants={registrants}
             selectedIds={selectedIds}
             setSelectedIds={setSelectedIds}
             date={deleteDate}
             setDate={setDeleteDate}
             time={deleteTime}
             setTime={setDeleteTime}
+            registrant={deleteUser}
+            setRegistrant={setDeleteUser}
             onDelete={deleteSelected}
             busy={busy}
             onBack={() => setView("main")}
@@ -530,6 +637,7 @@ export default function Home() {
         {view === "update" && (
           <SettingsView
             settings={settings}
+            records={allRecords}
             busy={busy}
             onSave={saveSettings}
             onBack={() => setView("main")}
@@ -538,6 +646,12 @@ export default function Home() {
       </main>
 
       <nav className="utility-nav" aria-label="データ管理">
+        <button
+          className={view === "stats" ? "active" : ""}
+          onClick={() => setView("stats")}
+        >
+          <span>▦</span>データ閲覧
+        </button>
         <button
           className={view === "delete" ? "active" : ""}
           onClick={() => setView("delete")}
@@ -715,13 +829,15 @@ function AuthScreen({
 
 function MainView({
   settings,
+  survivorOptions,
   selectedMap,
   chooseMap,
   bans,
   setBans,
   duplicateBan,
-  loadingMap,
-  mapRecords,
+  loadingRecords,
+  totalRecords,
+  mapRecordCount,
   runPrediction,
   prediction,
   hasSearched,
@@ -731,13 +847,15 @@ function MainView({
   busy,
 }: {
   settings: AppSettings;
+  survivorOptions: string[];
   selectedMap: string;
   chooseMap: (map: string) => void;
   bans: string[];
   setBans: (value: string[]) => void;
   duplicateBan: boolean;
-  loadingMap: boolean;
-  mapRecords: MatchRecord[];
+  loadingRecords: boolean;
+  totalRecords: number;
+  mapRecordCount: number;
   runPrediction: () => void;
   prediction: PredictionResult;
   hasSearched: boolean;
@@ -783,7 +901,10 @@ function MainView({
             <span>02</span>
             <div>
               <h2>BANサバイバー</h2>
-              <p>最大{settings.banSlots}人・BANなし対応</p>
+              <p>
+                最大{settings.banSlots}人・順不同／表示は
+                {BAN_ORDER_LABELS[settings.banOrderMode]}
+              </p>
             </div>
             <b className="ban-count">
               {normalizeBans(bans).length}/{settings.banSlots}
@@ -802,7 +923,7 @@ function MainView({
                   }}
                 >
                   <option>{BAN_NONE}</option>
-                  {settings.survivors.map((survivor) => (
+                  {survivorOptions.map((survivor) => (
                     <option key={survivor}>{survivor}</option>
                   ))}
                 </select>
@@ -815,14 +936,14 @@ function MainView({
           <button
             className="primary-button search-button"
             onClick={runPrediction}
-            disabled={!selectedMap || duplicateBan || loadingMap}
+            disabled={!selectedMap || duplicateBan || loadingRecords}
           >
             <span>予測を実行</span>
             <small>
-              {loadingMap
-                ? "データを先読み中..."
+              {loadingRecords
+                ? "データを読み込み中..."
                 : selectedMap
-                  ? `${mapRecords.length}件を即時集計`
+                  ? `全${totalRecords}件（該当マップ${mapRecordCount}件）から算出`
                   : "マップを選択してください"}
             </small>
           </button>
@@ -846,9 +967,15 @@ function MainView({
             </div>
           ) : prediction.rows.length ? (
             <>
-              {prediction.basis === "map" && (
-                <div className="fallback-note">
-                  同じBAN構成の実績がないため、同一マップ全体から予測しています。
+              <div className="fallback-note">{prediction.basis}</div>
+              {prediction.tiers.length > 0 && (
+                <div className="tier-row">
+                  {prediction.tiers.map((tier) => (
+                    <span key={tier.label}>
+                      {tier.label}
+                      <b>{tier.count}件</b>
+                    </span>
+                  ))}
                 </div>
               )}
               <div className="prediction-head">
@@ -909,13 +1036,209 @@ function MainView({
   );
 }
 
+function RankingTable({
+  ranking,
+  nameLabel,
+  countLabel,
+  rateLabel,
+  rateHint,
+}: {
+  ranking: RankingResult;
+  nameLabel: string;
+  countLabel: string;
+  rateLabel: string;
+  rateHint: string;
+}) {
+  const max = ranking.rows[0]?.rate ?? 0;
+
+  if (!ranking.rows.length) {
+    return (
+      <div className="empty-result">
+        <span className="radar-mark">0</span>
+        <h3>データがありません</h3>
+        <p>選択したシーズンに登録データがありません。</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <p className="ranking-hint">
+        集計対象 <b>{ranking.totalMatches}</b> 試合 ／ {rateHint}
+      </p>
+      <div className="ranking-head">
+        <span>順位</span>
+        <span>{nameLabel}</span>
+        <span>{countLabel}</span>
+        <span>{rateLabel}</span>
+      </div>
+      <ol className="ranking-list">
+        {ranking.rows.map((row, index) => (
+          <li key={row.name}>
+            <span className="rank">{String(index + 1).padStart(2, "0")}</span>
+            <strong>{row.name}</strong>
+            <div className="probability">
+              <span style={{ width: `${max ? (row.rate / max) * 100 : 0}%` }} />
+            </div>
+            <small>{row.count}回</small>
+            <b>{row.rate.toFixed(1)}%</b>
+          </li>
+        ))}
+      </ol>
+    </>
+  );
+}
+
+function StatsView({
+  records,
+  seasons,
+  loading,
+  onBack,
+}: {
+  records: MatchRecord[];
+  seasons: string[];
+  loading: boolean;
+  onBack: () => void;
+}) {
+  const [tab, setTab] = useState<"bans" | "hunters" | "maps">("bans");
+  const [season, setSeason] = useState(ALL_SEASONS);
+  const [focusMap, setFocusMap] = useState("");
+
+  const seasonRecords = useMemo(
+    () => filterBySeason(records, season),
+    [records, season],
+  );
+  const banRanking = useMemo(
+    () => buildBanRanking(seasonRecords),
+    [seasonRecords],
+  );
+  const hunterRanking = useMemo(
+    () => buildHunterRanking(seasonRecords),
+    [seasonRecords],
+  );
+  const mapStats = useMemo(
+    () => buildMapHunterStats(seasonRecords),
+    [seasonRecords],
+  );
+
+  const activeMap =
+    mapStats.find((item) => item.map === focusMap) ?? mapStats[0] ?? null;
+
+  return (
+    <AuxiliaryPage
+      eyebrow="DATA INSIGHT"
+      title="Banデータ閲覧"
+      description="登録済みデータを集計し、BAN傾向とハンター使用率をシーズン別に確認します。"
+      onBack={onBack}
+    >
+      <section className="panel stats-panel">
+        <div className="tabs">
+          <button
+            className={tab === "bans" ? "active" : ""}
+            onClick={() => setTab("bans")}
+          >
+            BANランキング
+          </button>
+          <button
+            className={tab === "hunters" ? "active" : ""}
+            onClick={() => setTab("hunters")}
+          >
+            ハンター使用率
+          </button>
+          <button
+            className={tab === "maps" ? "active" : ""}
+            onClick={() => setTab("maps")}
+          >
+            マップ別ハンター
+          </button>
+        </div>
+
+        <div className="filter-bar">
+          <label>
+            シーズン
+            <select
+              value={season}
+              onChange={(event) => setSeason(event.target.value)}
+            >
+              <option value={ALL_SEASONS}>全シーズン</option>
+              {seasons.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
+          </label>
+          <span className="record-count">{seasonRecords.length}件</span>
+        </div>
+
+        <div className="stats-body">
+          {loading ? (
+            <div className="empty-result">
+              <span className="loader" />
+              <h3>集計中</h3>
+              <p>共有データを読み込んでいます。</p>
+            </div>
+          ) : tab === "bans" ? (
+            <RankingTable
+              ranking={banRanking}
+              nameLabel="サバイバー"
+              countLabel="Ban回数"
+              rateLabel="Ban率"
+              rateHint="Ban率は「対象試合数のうちBANされた試合の割合」です"
+            />
+          ) : tab === "hunters" ? (
+            <RankingTable
+              ranking={hunterRanking}
+              nameLabel="ハンター"
+              countLabel="使用回数"
+              rateLabel="使用率"
+              rateHint="使用率は「対象試合数のうち実際にピックされた割合」です"
+            />
+          ) : !activeMap ? (
+            <div className="empty-result">
+              <span className="radar-mark">0</span>
+              <h3>データがありません</h3>
+              <p>選択したシーズンに登録データがありません。</p>
+            </div>
+          ) : (
+            <>
+              <div className="map-chip-row">
+                {mapStats.map((item) => (
+                  <button
+                    key={item.map}
+                    className={item.map === activeMap.map ? "selected" : ""}
+                    onClick={() => setFocusMap(item.map)}
+                  >
+                    {item.map}
+                    <b>{item.totalMatches}</b>
+                  </button>
+                ))}
+              </div>
+              <RankingTable
+                ranking={{
+                  rows: activeMap.rows,
+                  totalMatches: activeMap.totalMatches,
+                }}
+                nameLabel={`${activeMap.map} のハンター`}
+                countLabel="使用回数"
+                rateLabel="使用率"
+                rateHint="このマップの試合数に対する割合です"
+              />
+            </>
+          )}
+        </div>
+      </section>
+    </AuxiliaryPage>
+  );
+}
+
 function AddView({
   settings,
+  survivorOptions,
   busy,
   onSave,
   onBack,
 }: {
   settings: AppSettings;
+  survivorOptions: string[];
   busy: boolean;
   onSave: (map: string, bans: string[], hunter: string) => Promise<boolean>;
   onBack: () => void;
@@ -955,7 +1278,7 @@ function AddView({
                 }}
               >
                 <option>{BAN_NONE}</option>
-                {settings.survivors.map((item) => (
+                {survivorOptions.map((item) => (
                   <option key={item}>{item}</option>
                 ))}
               </select>
@@ -993,23 +1316,29 @@ function AddView({
 
 function DeleteView({
   records,
+  registrants,
   selectedIds,
   setSelectedIds,
   date,
   setDate,
   time,
   setTime,
+  registrant,
+  setRegistrant,
   onDelete,
   busy,
   onBack,
 }: {
   records: MatchRecord[];
+  registrants: { uid: string; name: string }[];
   selectedIds: Set<string>;
   setSelectedIds: (ids: Set<string>) => void;
   date: string;
   setDate: (value: string) => void;
   time: string;
   setTime: (value: string) => void;
+  registrant: string;
+  setRegistrant: (value: string) => void;
   onDelete: () => void;
   busy: boolean;
   onBack: () => void;
@@ -1021,7 +1350,7 @@ function DeleteView({
     <AuxiliaryPage
       eyebrow="DATA CONTROL"
       title="登録データの削除"
-      description="登録日時で絞り込み、複数件をまとめて削除できます。"
+      description="登録日時と登録ユーザーで絞り込み、複数件をまとめて削除できます。"
       onBack={onBack}
     >
       <section className="panel delete-panel">
@@ -1034,11 +1363,24 @@ function DeleteView({
             登録時間
             <input type="time" value={time} onChange={(e) => setTime(e.target.value)} />
           </label>
+          <label>
+            登録ユーザー
+            <select
+              value={registrant}
+              onChange={(e) => setRegistrant(e.target.value)}
+            >
+              <option value={ALL_USERS}>全ユーザー</option>
+              {registrants.map((item) => (
+                <option key={item.uid} value={item.uid}>{item.name}</option>
+              ))}
+            </select>
+          </label>
           <button
             className="secondary-button"
             onClick={() => {
               setDate("");
               setTime("");
+              setRegistrant(ALL_USERS);
             }}
           >
             条件をクリア
@@ -1120,120 +1462,485 @@ function DeleteView({
   );
 }
 
+function moveItem<T>(items: T[], from: number, to: number) {
+  const target = Math.min(items.length - 1, Math.max(0, to));
+  if (from === target || Number.isNaN(target)) return items;
+  const next = [...items];
+  const [moved] = next.splice(from, 1);
+  next.splice(target, 0, moved);
+  return next;
+}
+
+function MasterEditor({
+  draft,
+  setDraft,
+  plan,
+  setPlan,
+}: {
+  draft: AppSettings;
+  setDraft: (value: AppSettings) => void;
+  plan: RenamePlan;
+  setPlan: (value: RenamePlan) => void;
+}) {
+  const [kind, setKind] = useState<MasterKind>("survivors");
+  const [newItem, setNewItem] = useState("");
+  const list = draft[kind];
+
+  const commitList = (next: string[]) => {
+    // シーズン名を変えたときは、現在シーズンの指定も追従させる。
+    if (kind === "seasons" && !next.includes(draft.currentSeason)) {
+      const index = list.indexOf(draft.currentSeason);
+      const replacement = index >= 0 ? next[index] : next[0];
+      setDraft({ ...draft, seasons: next, currentSeason: replacement ?? "" });
+      return;
+    }
+    setDraft({ ...draft, [kind]: next });
+  };
+
+  const addItem = () => {
+    const value = newItem.trim();
+    if (!value || list.includes(value)) return;
+    // シーズンは新しいものほど先頭に置く。
+    commitList(kind === "seasons" ? [value, ...list] : [...list, value]);
+    setNewItem("");
+  };
+
+  const rename = (index: number, value: string) => {
+    const current = list[index];
+    const next = [...list];
+    next[index] = value;
+    commitList(next);
+    setPlan(planRename(plan, kind, current, value));
+  };
+
+  const remove = (index: number) => {
+    commitList(list.filter((_, i) => i !== index));
+  };
+
+  const duplicates = list.filter(
+    (item, index) => item.trim() && list.indexOf(item) !== index,
+  );
+  const blanks = list.filter((item) => !item.trim()).length;
+  const renames = activeRenames(plan, kind);
+
+  return (
+    <section className="panel master-editor">
+      <div className="tabs">
+        {(Object.keys(MASTER_LABELS) as MasterKind[]).map((key) => (
+          <button
+            key={key}
+            className={kind === key ? "active" : ""}
+            onClick={() => {
+              setKind(key);
+              setNewItem("");
+            }}
+          >
+            {MASTER_LABELS[key]}
+          </button>
+        ))}
+      </div>
+
+      <p className="editor-hint">
+        名前を書き換えると、登録済みの全データも新しい名称へ置き換わります。
+        番号を入力するか矢印を押すと並び順が変わり、すべてのドロップダウンへ反映されます。
+        {kind === "seasons" && "シーズンは上にあるものほど新しい扱いになります。"}
+      </p>
+
+      <div className="add-master">
+        <input
+          value={newItem}
+          onChange={(event) => setNewItem(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") addItem();
+          }}
+          placeholder={`${MASTER_LABELS[kind]}名を入力`}
+        />
+        <button className="secondary-button" onClick={addItem}>追加</button>
+      </div>
+
+      {(duplicates.length > 0 || blanks > 0) && (
+        <p className="form-error">
+          {blanks > 0 && "名称が空の項目があります。"}
+          {duplicates.length > 0 && `「${duplicates[0]}」が重複しています。`}
+        </p>
+      )}
+
+      {renames.length > 0 && (
+        <div className="rename-preview">
+          <strong>保存時に置き換える名称</strong>
+          {renames.map(([from, to]) => (
+            <span key={from}>{from} → {to}</span>
+          ))}
+        </div>
+      )}
+
+      <ol className="master-rows">
+        {list.map((item, index) => (
+          <li key={index}>
+            <select
+              className="order-input"
+              value={index + 1}
+              aria-label={`${item || "未入力"}の並び順`}
+              onChange={(event) =>
+                commitList(moveItem(list, index, Number(event.target.value) - 1))
+              }
+            >
+              {list.map((_, position) => (
+                <option key={position} value={position + 1}>
+                  {position + 1}
+                </option>
+              ))}
+            </select>
+            <input
+              className="name-input"
+              value={item}
+              aria-label={`${MASTER_LABELS[kind]}名`}
+              onChange={(event) => rename(index, event.target.value)}
+            />
+            <button
+              className="icon-button"
+              aria-label={`${item}を上へ`}
+              disabled={index === 0}
+              onClick={() => commitList(moveItem(list, index, index - 1))}
+            >
+              ↑
+            </button>
+            <button
+              className="icon-button"
+              aria-label={`${item}を下へ`}
+              disabled={index === list.length - 1}
+              onClick={() => commitList(moveItem(list, index, index + 1))}
+            >
+              ↓
+            </button>
+            <button
+              className="icon-button danger"
+              aria-label={`${item}を削除`}
+              onClick={() => remove(index)}
+            >
+              ×
+            </button>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function PredictionEditor({
+  draft,
+  setDraft,
+}: {
+  draft: AppSettings;
+  setDraft: (value: AppSettings) => void;
+}) {
+  const config = draft.prediction;
+
+  const patchFactor = (id: string, patch: Partial<FactorConfig>) => {
+    setDraft({
+      ...draft,
+      prediction: {
+        ...config,
+        factors: {
+          ...config.factors,
+          [id]: { ...config.factors[id], ...patch },
+        },
+      },
+    });
+  };
+
+  return (
+    <section className="panel prediction-editor">
+      <div className="editor-head">
+        <div>
+          <h2>予測設定</h2>
+          <p>
+            1件ごとのスコアは<code>（基礎スコア ＋ 加算値の合計）× 補正倍率</code>
+            で決まり、ハンター別の合計スコアの比率がそのまま予測率（合計100%）になります。
+          </p>
+        </div>
+        <button
+          className="secondary-button"
+          onClick={() =>
+            setDraft({
+              ...draft,
+              prediction: defaultPredictionConfig(draft.banSlots),
+            })
+          }
+        >
+          デフォルトへ戻す
+        </button>
+      </div>
+
+      <label className="base-weight">
+        基礎スコア
+        <input
+          type="number"
+          min={0}
+          max={50}
+          step={0.5}
+          value={config.baseWeight}
+          onChange={(event) =>
+            setDraft({
+              ...draft,
+              prediction: {
+                ...config,
+                baseWeight: Number(event.target.value) || 0,
+              },
+            })
+          }
+        />
+        <small>どの条件にも一致しないデータへ与える最低スコアです。</small>
+      </label>
+
+      {PREDICTION_FACTORS.map((factor) => {
+        const factorConfig = config.factors[factor.id];
+        if (!factorConfig) return null;
+        return (
+          <article
+            key={factor.id}
+            className={`factor-card ${factorConfig.enabled ? "" : "off"}`}
+          >
+            <header>
+              <div>
+                <h3>{factor.label}</h3>
+                <p>{factor.description}</p>
+              </div>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={factorConfig.enabled}
+                  onChange={(event) =>
+                    patchFactor(factor.id, { enabled: event.target.checked })
+                  }
+                />
+                <span>{factorConfig.enabled ? "ON" : "OFF"}</span>
+              </label>
+            </header>
+
+            {factorConfig.enabled && (
+              <div className="factor-body">
+                {factor.params.map((spec) => (
+                  <label key={spec.key} className="param-field">
+                    {spec.label}
+                    <input
+                      type="number"
+                      min={spec.min}
+                      max={spec.max}
+                      step={spec.step}
+                      value={factorConfig.params[spec.key] ?? 0}
+                      onChange={(event) =>
+                        patchFactor(factor.id, {
+                          params: {
+                            ...factorConfig.params,
+                            [spec.key]: Number(event.target.value) || 0,
+                          },
+                        })
+                      }
+                    />
+                    {spec.hint && <small>{spec.hint}</small>}
+                  </label>
+                ))}
+
+                {factor.series.map((spec) => {
+                  const labels = spec.labels(draft);
+                  const values = factorConfig.series[spec.key] ?? [];
+                  return (
+                    <div key={spec.key} className="factor-series">
+                      <p className="series-label">
+                        {spec.label}
+                        {spec.hint && <small>{spec.hint}</small>}
+                      </p>
+                      <div className="series-grid">
+                        {labels.map((label, index) => (
+                          <label key={label}>
+                            {label}
+                            <input
+                              type="number"
+                              min={spec.min}
+                              max={spec.max}
+                              step={spec.step}
+                              value={values[index] ?? 0}
+                              onChange={(event) => {
+                                const next = labels.map((_, i) => values[i] ?? 0);
+                                next[index] = Number(event.target.value) || 0;
+                                patchFactor(factor.id, {
+                                  series: {
+                                    ...factorConfig.series,
+                                    [spec.key]: next,
+                                  },
+                                });
+                              }}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </article>
+        );
+      })}
+    </section>
+  );
+}
+
 function SettingsView({
   settings,
+  records,
   busy,
   onSave,
   onBack,
 }: {
   settings: AppSettings;
+  records: MatchRecord[];
   busy: boolean;
-  onSave: (settings: AppSettings) => void;
+  onSave: (settings: AppSettings, plan: RenamePlan) => Promise<boolean>;
   onBack: () => void;
 }) {
   const [draft, setDraft] = useState<AppSettings>(settings);
-  const [tab, setTab] = useState<"survivors" | "hunters" | "maps">("survivors");
-  const [newItem, setNewItem] = useState("");
-  const labels = {
-    survivors: "サバイバー",
-    hunters: "ハンター",
-    maps: "マップ",
-  };
+  const [plan, setPlan] = useState<RenamePlan>(emptyRenamePlan());
+  const [section, setSection] = useState<"basic" | "prediction" | "master">(
+    "basic",
+  );
 
-  const list = draft[tab];
-  const addItem = () => {
-    const value = newItem.trim();
-    if (!value || list.includes(value)) return;
-    setDraft({ ...draft, [tab]: [...list, value] });
-    setNewItem("");
-  };
+  const invalid = (Object.keys(MASTER_LABELS) as MasterKind[]).some((kind) => {
+    const list = draft[kind];
+    return (
+      list.some((item) => !item.trim()) ||
+      list.some((item, index) => list.indexOf(item) !== index)
+    );
+  });
+
+  const affected = useMemo(
+    () =>
+      hasRenames(plan)
+        ? records.filter((record) => renameFieldsForRecord(record, plan)).length
+        : 0,
+    [plan, records],
+  );
 
   return (
     <AuxiliaryPage
       eyebrow="SYSTEM MASTER"
       title="マスターデータ更新"
-      description="ゲームのアップデートに合わせて選択肢とBAN数を変更します。"
+      description="選択肢・並び順・名称・予測アルゴリズムの重みをまとめて管理します。"
       onBack={onBack}
     >
-      <div className="settings-grid">
-        <section className="panel settings-summary">
+      <div className="tabs section-tabs">
+        <button
+          className={section === "basic" ? "active" : ""}
+          onClick={() => setSection("basic")}
+        >
+          基本設定
+        </button>
+        <button
+          className={section === "prediction" ? "active" : ""}
+          onClick={() => setSection("prediction")}
+        >
+          予測設定
+        </button>
+        <button
+          className={section === "master" ? "active" : ""}
+          onClick={() => setSection("master")}
+        >
+          マスターデータ
+        </button>
+      </div>
+
+      {section === "basic" && (
+        <section className="panel settings-summary wide-panel">
           <h2>基本設定</h2>
           <label>
             現在のシーズン
-            <input
+            <select
               value={draft.currentSeason}
               onChange={(event) =>
                 setDraft({ ...draft, currentSeason: event.target.value })
               }
-            />
+            >
+              {draft.seasons.map((season) => (
+                <option key={season}>{season}</option>
+              ))}
+            </select>
+            <small>シーズンの追加・並び替えは「マスターデータ」タブで行います。</small>
           </label>
           <label>
             BAN人数
             <select
               value={draft.banSlots}
               onChange={(event) =>
-                setDraft({ ...draft, banSlots: Number(event.target.value) })
+                setDraft(resizeBanMatchWeights(draft, Number(event.target.value)))
               }
             >
-              {[1, 2, 3, 4, 5, 6].map((count) => (
-                <option key={count} value={count}>{count}人</option>
+              {Array.from({ length: MAX_BAN_SLOTS }, (_, i) => i + 1).map(
+                (count) => (
+                  <option key={count} value={count}>{count}人</option>
+                ),
+              )}
+            </select>
+          </label>
+          <label>
+            BANサバイバーの表示順
+            <select
+              value={draft.banOrderMode}
+              onChange={(event) =>
+                setDraft({
+                  ...draft,
+                  banOrderMode: event.target.value as BanOrderMode,
+                })
+              }
+            >
+              {(Object.keys(BAN_ORDER_LABELS) as BanOrderMode[]).map((mode) => (
+                <option key={mode} value={mode}>{BAN_ORDER_LABELS[mode]}</option>
               ))}
             </select>
+            <small>
+              Ban率順にすると、Banデータ閲覧のランキングと同じ順序で検索画面へ表示します。
+            </small>
           </label>
           <div className="master-counts">
             <span><b>{draft.survivors.length}</b>サバイバー</span>
             <span><b>{draft.hunters.length}</b>ハンター</span>
             <span><b>{draft.maps.length}</b>マップ</span>
+            <span><b>{draft.seasons.length}</b>シーズン</span>
           </div>
         </section>
-        <section className="panel master-editor">
-          <div className="tabs">
-            {(["survivors", "hunters", "maps"] as const).map((key) => (
-              <button
-                key={key}
-                className={tab === key ? "active" : ""}
-                onClick={() => {
-                  setTab(key);
-                  setNewItem("");
-                }}
-              >
-                {labels[key]}
-              </button>
-            ))}
-          </div>
-          <div className="add-master">
-            <input
-              value={newItem}
-              onChange={(event) => setNewItem(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") addItem();
-              }}
-              placeholder={`${labels[tab]}名を入力`}
-            />
-            <button className="secondary-button" onClick={addItem}>追加</button>
-          </div>
-          <div className="master-list">
-            {list.map((item) => (
-              <span key={item}>
-                {item}
-                <button
-                  aria-label={`${item}を削除`}
-                  onClick={() =>
-                    setDraft({
-                      ...draft,
-                      [tab]: list.filter((value) => value !== item),
-                    })
-                  }
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
-        </section>
-      </div>
+      )}
+
+      {section === "prediction" && (
+        <PredictionEditor draft={draft} setDraft={setDraft} />
+      )}
+
+      {section === "master" && (
+        <MasterEditor
+          draft={draft}
+          setDraft={setDraft}
+          plan={plan}
+          setPlan={setPlan}
+        />
+      )}
+
       <div className="settings-actions">
-        <button className="primary-button" disabled={busy} onClick={() => onSave(draft)}>
+        {affected > 0 && (
+          <span className="rename-count">
+            読み込み済み{affected}件のデータを名称変更します
+          </span>
+        )}
+        {invalid && (
+          <span className="rename-count error">
+            名称の空欄・重複を解消してください
+          </span>
+        )}
+        <button
+          className="primary-button"
+          disabled={busy || invalid}
+          onClick={async () => {
+            if (await onSave(draft, plan)) setPlan(emptyRenamePlan());
+          }}
+        >
           {busy ? "保存中..." : "変更を保存"}
         </button>
       </div>

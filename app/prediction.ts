@@ -1,47 +1,371 @@
-import { BAN_NONE } from "./constants";
-import type { MatchRecord, PredictionResult } from "./types";
+import { SEASON_AGE_BUCKETS } from "./constants";
+import { normalizeBans } from "./stats";
+import type {
+  AppSettings,
+  FactorConfig,
+  MatchRecord,
+  PredictionResult,
+  PredictionRow,
+  PredictionTier,
+} from "./types";
 
-export function normalizeBans(bans: string[]) {
-  return bans
-    .filter((ban) => ban && ban !== BAN_NONE)
-    .filter((ban, index, all) => all.indexOf(ban) === index)
-    .sort((a, b) => a.localeCompare(b, "ja"));
+export { normalizeBans, banSignature } from "./stats";
+
+export type PredictionQuery = {
+  map: string;
+  bans: string[];
+  /** 検索時点のシーズン。シーズン補正の基準に使う。 */
+  season?: string;
+};
+
+/** 1件の登録データを評価するときに、各ファクターへ渡される情報。 */
+export type FactorContext = {
+  record: MatchRecord;
+  query: PredictionQuery;
+  /** 検索条件のBANと一致したサバイバー */
+  matchedBans: string[];
+  banMatchCount: number;
+  mapMatched: boolean;
+  /** 0 = 最新シーズン、SEASON_AGE_BUCKETS-1 = それ以前 */
+  seasonAge: number;
+  /** サバイバー別のBAN率（0〜1） */
+  banRate: Map<string, number>;
+  config: FactorConfig;
+  settings: AppSettings;
+};
+
+/**
+ * ファクターの評価結果。
+ * add      … 基礎スコアへの加算（一致の強さ）
+ * multiply … 合計スコアへの倍率（補正）
+ * exclude  … このデータを予測から除外する
+ */
+export type FactorResult = {
+  add?: number;
+  multiply?: number;
+  exclude?: boolean;
+};
+
+export type FactorParamSpec = {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  hint?: string;
+};
+
+export type FactorSeriesSpec = {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  hint?: string;
+  /** 各要素の見出し。BAN人数やシーズン名に追随させるため関数で受け取る。 */
+  labels: (settings: AppSettings) => string[];
+};
+
+/**
+ * 予測の評価要素。新しい要素を足すときは、このリストへ1件追加し
+ * defaultPredictionConfig() に既定値を足すだけでよい（管理画面は自動生成）。
+ */
+export type PredictionFactor = {
+  id: string;
+  label: string;
+  description: string;
+  params: FactorParamSpec[];
+  series: FactorSeriesSpec[];
+  score: (context: FactorContext) => FactorResult;
+};
+
+export const PREDICTION_FACTORS: PredictionFactor[] = [
+  {
+    id: "banMatch",
+    label: "Ban一致",
+    description:
+      "検索条件と同じサバイバーがBANされているデータを高く評価します。BANの順番は問いません。",
+    params: [],
+    series: [
+      {
+        key: "weights",
+        label: "一致数ごとの重み",
+        min: 0,
+        max: 200,
+        step: 1,
+        labels: (settings) =>
+          Array.from(
+            { length: settings.banSlots + 1 },
+            (_, index) => `${index}一致`,
+          ),
+      },
+    ],
+    score: ({ banMatchCount, config }) => ({
+      add: config.series.weights?.[banMatchCount] ?? 0,
+    }),
+  },
+  {
+    id: "mapMatch",
+    label: "マップ補正",
+    description: "マップが一致したデータへ重みを加算します。",
+    params: [
+      {
+        key: "weight",
+        label: "マップ一致時の加算値",
+        min: 0,
+        max: 200,
+        step: 1,
+      },
+    ],
+    series: [],
+    score: ({ mapMatched, config }) => ({
+      add: mapMatched ? (config.params.weight ?? 0) : 0,
+    }),
+  },
+  {
+    id: "rareBan",
+    label: "希少Ban補正",
+    description:
+      "BAN率が低いサバイバーほど特徴的な情報として、一致時の評価を引き上げます。倍率は最大値までの範囲で希少度に比例します。",
+    params: [
+      {
+        key: "maxBonus",
+        label: "最大加算倍率",
+        min: 0,
+        max: 3,
+        step: 0.05,
+        hint: "0.5 なら最大 1.5 倍",
+      },
+    ],
+    series: [],
+    score: ({ matchedBans, banRate, config }) => {
+      if (!matchedBans.length) return { multiply: 1 };
+      const rarity =
+        matchedBans.reduce(
+          (total, ban) => total + (1 - Math.min(1, banRate.get(ban) ?? 0)),
+          0,
+        ) / matchedBans.length;
+      return { multiply: 1 + (config.params.maxBonus ?? 0) * rarity };
+    },
+  },
+  {
+    id: "season",
+    label: "シーズン補正",
+    description:
+      "新しいシーズンのデータを優先します。倍率が 0 のシーズンはデータが使われません。",
+    params: [],
+    series: [
+      {
+        key: "weights",
+        label: "シーズンごとの倍率",
+        min: 0,
+        max: 3,
+        step: 0.05,
+        labels: (settings) =>
+          Array.from({ length: SEASON_AGE_BUCKETS }, (_, index) => {
+            if (index === SEASON_AGE_BUCKETS - 1) return "それ以前";
+            const name = settings.seasons[index];
+            const prefix = index === 0 ? "最新" : `${index}つ前`;
+            return name ? `${prefix}（${name}）` : prefix;
+          }),
+      },
+    ],
+    score: ({ seasonAge, config }) => ({
+      multiply: config.series.weights?.[seasonAge] ?? 1,
+    }),
+  },
+];
+
+const EMPTY_FACTOR_CONFIG: FactorConfig = {
+  enabled: false,
+  params: {},
+  series: {},
+};
+
+function seasonAgeOf(season: string, settings: AppSettings) {
+  const index = settings.seasons.indexOf(season);
+  if (index < 0) return SEASON_AGE_BUCKETS - 1;
+  return Math.min(index, SEASON_AGE_BUCKETS - 1);
 }
 
-export function banSignature(bans: string[]) {
-  return normalizeBans(bans).join("|");
+function tierLabel(banMatchCount: number, mapMatched: boolean, matched: boolean) {
+  if (!matched) return "一致なし（全体傾向）";
+  const parts: string[] = [];
+  if (banMatchCount > 0) parts.push(`BAN${banMatchCount}一致`);
+  if (mapMatched) parts.push("マップ一致");
+  return parts.length ? parts.join(" + ") : "一致なし（全体傾向）";
 }
 
-export function buildPrediction(
-  records: MatchRecord[],
-  map: string,
-  bans: string[],
-): PredictionResult {
-  const mapRecords = records.filter((record) => record.map === map);
-  const signature = banSignature(bans);
-  const exact = mapRecords.filter(
-    (record) => banSignature(record.bans) === signature,
-  );
-  const source = exact.length > 0 ? exact : mapRecords;
-
-  if (source.length === 0) {
-    return { rows: [], total: 0, basis: "none" };
+/** 合計がちょうど 100 になるように整数化する（最大剰余方式）。 */
+function toPercentages(values: number[]): number[] {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (total <= 0) return values.map(() => 0);
+  const exact = values.map((value) => (value / total) * 100);
+  const floors = exact.map((value) => Math.floor(value));
+  let remainder = 100 - floors.reduce((sum, value) => sum + value, 0);
+  const byFraction = exact
+    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+    .sort((a, b) => b.fraction - a.fraction);
+  const result = [...floors];
+  for (let i = 0; i < byFraction.length && remainder > 0; i += 1, remainder -= 1) {
+    result[byFraction[i].index] += 1;
   }
+  return result;
+}
 
-  const counts = new Map<string, number>();
-  source.forEach((record) => {
-    counts.set(record.hunter, (counts.get(record.hunter) ?? 0) + 1);
+type ScoredRecord = {
+  record: MatchRecord;
+  score: number;
+  /** ファクターによる加算の合計。0 なら「類似していない」データ。 */
+  relevance: number;
+  banMatchCount: number;
+  mapMatched: boolean;
+};
+
+function scoreRecord(
+  record: MatchRecord,
+  query: PredictionQuery,
+  settings: AppSettings,
+  banRate: Map<string, number>,
+  queryBans: Set<string>,
+): ScoredRecord {
+  const recordBans = normalizeBans(record.bans);
+  const matchedBans = recordBans.filter((ban) => queryBans.has(ban));
+  const mapMatched = Boolean(query.map) && record.map === query.map;
+  const config = settings.prediction;
+
+  const context: Omit<FactorContext, "config"> = {
+    record,
+    query,
+    matchedBans,
+    banMatchCount: matchedBans.length,
+    mapMatched,
+    seasonAge: seasonAgeOf(record.season, settings),
+    banRate,
+    settings,
+  };
+
+  let add = 0;
+  let multiply = 1;
+  let excluded = false;
+
+  PREDICTION_FACTORS.forEach((factor) => {
+    const factorConfig = config.factors[factor.id] ?? EMPTY_FACTOR_CONFIG;
+    if (!factorConfig.enabled) return;
+    const result = factor.score({ ...context, config: factorConfig });
+    if (result.exclude) excluded = true;
+    add += result.add ?? 0;
+    multiply *= result.multiply ?? 1;
   });
 
+  const score = excluded
+    ? 0
+    : Math.max(0, (config.baseWeight + add) * multiply);
+
   return {
-    total: source.length,
-    basis: exact.length > 0 ? "exact" : "map",
-    rows: [...counts.entries()]
-      .map(([hunter, count]) => ({
-        hunter,
-        count,
-        probability: Math.round((count / source.length) * 100),
-      }))
-      .sort((a, b) => b.count - a.count || a.hunter.localeCompare(b.hunter, "ja")),
+    record,
+    score,
+    relevance: excluded ? 0 : add,
+    banMatchCount: matchedBans.length,
+    mapMatched,
   };
+}
+
+/**
+ * 類似データも含めてスコアリングし、ハンターごとの予測率（合計100%）を返す。
+ * 完全一致データが無い場合も、一致度の低いデータを重み付けして必ず結果を返す。
+ */
+export function buildPrediction(
+  records: MatchRecord[],
+  query: PredictionQuery,
+  settings: AppSettings,
+  banRate: Map<string, number>,
+): PredictionResult {
+  const empty: PredictionResult = {
+    rows: [],
+    total: 0,
+    exactCount: 0,
+    basis: "データがありません",
+    tiers: [],
+  };
+  if (!records.length) return empty;
+
+  const queryBans = new Set(normalizeBans(query.bans));
+  const scored = records.map((record) =>
+    scoreRecord(record, query, settings, banRate, queryBans),
+  );
+
+  const matched = scored.filter((item) => item.relevance > 0 && item.score > 0);
+  let used = matched;
+  let usingFallback = false;
+
+  if (!used.length) {
+    // 類似データが1件も無いときは、全データの傾向から予測する。
+    usingFallback = true;
+    used = scored.filter((item) => item.score > 0);
+  }
+  if (!used.length) {
+    // 補正で全データのスコアが 0 になった場合は、均等重みで最低限の結果を返す。
+    usingFallback = true;
+    used = scored.map((item) => ({ ...item, score: 1 }));
+  }
+
+  const byHunter = new Map<string, { score: number; count: number }>();
+  used.forEach((item) => {
+    const hunter = item.record.hunter;
+    if (!hunter) return;
+    const bucket = byHunter.get(hunter) ?? { score: 0, count: 0 };
+    bucket.score += item.score;
+    bucket.count += 1;
+    byHunter.set(hunter, bucket);
+  });
+
+  if (!byHunter.size) return empty;
+
+  const entries = [...byHunter.entries()].sort(
+    (a, b) =>
+      b[1].score - a[1].score ||
+      b[1].count - a[1].count ||
+      a[0].localeCompare(b[0], "ja"),
+  );
+  const percentages = toPercentages(entries.map(([, value]) => value.score));
+
+  const rows: PredictionRow[] = entries.map(([hunter, value], index) => ({
+    hunter,
+    count: value.count,
+    score: Math.round(value.score * 10) / 10,
+    probability: percentages[index],
+  }));
+
+  const tierMap = new Map<string, PredictionTier>();
+  used.forEach((item) => {
+    const label = tierLabel(
+      item.banMatchCount,
+      item.mapMatched,
+      !usingFallback && item.relevance > 0,
+    );
+    const tier = tierMap.get(label) ?? { label, count: 0, score: 0 };
+    tier.count += 1;
+    tier.score += item.score;
+    tierMap.set(label, tier);
+  });
+  const tiers = [...tierMap.values()].sort(
+    (a, b) => b.score / b.count - a.score / a.count,
+  );
+
+  const fullBanCount = queryBans.size;
+  const exactCount = used.filter(
+    (item) =>
+      item.mapMatched &&
+      item.banMatchCount === fullBanCount &&
+      normalizeBans(item.record.bans).length === fullBanCount,
+  ).length;
+
+  const basis = usingFallback
+    ? "類似データが無いため、全データの傾向から予測しています"
+    : exactCount > 0
+      ? `完全一致 ${exactCount}件を中心に予測しています`
+      : `${tiers[0]?.label ?? "類似データ"}を中心に予測しています`;
+
+  return { rows, total: used.length, exactCount, basis, tiers };
 }
