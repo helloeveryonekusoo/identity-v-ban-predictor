@@ -112,8 +112,11 @@ export const BAN_NONE = "BANなし";
 /** 集計画面の「全シーズン」を表す番兵値。シーズン名として使えない文字を含める。 */
 export const ALL_SEASONS = "__all__";
 
-/** 削除画面の「全ユーザー」を表す番兵値。 */
+/** 削除・データ閲覧画面の「全ユーザー」を表す番兵値。 */
 export const ALL_USERS = "__all__";
+
+/** 削除・データ閲覧画面の「全ハンター」を表す番兵値。 */
+export const ALL_HUNTERS = "__all__";
 
 export const DEFAULT_SEASON = "現行シーズン";
 

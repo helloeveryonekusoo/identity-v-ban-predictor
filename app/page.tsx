@@ -22,8 +22,16 @@ import {
   writeBatch,
   type Firestore,
 } from "firebase/firestore";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
+  FormEvent,
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import {
+  ALL_HUNTERS,
   ALL_SEASONS,
   ALL_USERS,
   BAN_NONE,
@@ -50,13 +58,16 @@ import {
   renameFieldsForRecord,
 } from "./records";
 import {
+  EMPTY_RECORD_QUERY,
   buildBanRanking,
   buildBanRateIndex,
   buildHunterRanking,
   buildMapHunterStats,
+  collectHunters,
   collectRegistrants,
   collectSeasons,
   filterBySeason,
+  filterRecords,
   normalizeBans,
   orderSurvivors,
 } from "./stats";
@@ -67,7 +78,9 @@ import type {
   MasterKind,
   MatchRecord,
   PredictionResult,
+  PredictionRow,
   RankingResult,
+  RecordQuery,
   RenamePlan,
   ViewName,
 } from "./types";
@@ -113,6 +126,18 @@ function formatDateTime(value: MatchRecord["registeredAt"]) {
   if (!date) return "登録処理中";
   return new Intl.DateTimeFormat("ja-JP", {
     year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+/** 根拠の一覧は列が多いので、年を省いた短い表記にする。 */
+function formatDateTimeShort(value: MatchRecord["registeredAt"]) {
+  const date = toDate(value);
+  if (!date) return "登録処理中";
+  return new Intl.DateTimeFormat("ja-JP", {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -211,11 +236,6 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState("");
 
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [deleteDate, setDeleteDate] = useState("");
-  const [deleteTime, setDeleteTime] = useState("");
-  const [deleteUser, setDeleteUser] = useState(ALL_USERS);
-
   const signedIn = Boolean(user || demoMode);
   const displayName =
     user?.displayName || user?.email?.split("@")[0] || (demoMode ? "デモユーザー" : "");
@@ -300,6 +320,11 @@ export default function Home() {
   );
 
   const registrants = useMemo(() => collectRegistrants(allRecords), [allRecords]);
+
+  const hunterOptions = useMemo(
+    () => collectHunters(allRecords, settings.hunters),
+    [allRecords, settings.hunters],
+  );
 
   const mapRecordCount = useMemo(
     () =>
@@ -431,54 +456,27 @@ export default function Home() {
     [allRecords],
   );
 
-  const filteredRecords = useMemo(
-    () =>
-      sortedRecords.filter((record) => {
-        if (deleteUser !== ALL_USERS) {
-          const key = record.registeredByUid || record.registeredByName;
-          if (key !== deleteUser) return false;
-        }
-        if (!deleteDate && !deleteTime) return true;
-        const date = toDate(record.registeredAt);
-        if (!date) return false;
-        const localDate = [
-          date.getFullYear(),
-          String(date.getMonth() + 1).padStart(2, "0"),
-          String(date.getDate()).padStart(2, "0"),
-        ].join("-");
-        const localTime = `${String(date.getHours()).padStart(2, "0")}:${String(
-          date.getMinutes(),
-        ).padStart(2, "0")}`;
-        return (
-          (!deleteDate || localDate === deleteDate) &&
-          (!deleteTime || localTime === deleteTime)
-        );
-      }),
-    [deleteDate, deleteTime, deleteUser, sortedRecords],
-  );
-
-  const deleteSelected = async () => {
-    if (!selectedIds.size) {
+  const deleteRecords = async (ids: Set<string>) => {
+    if (!ids.size) {
       notify("削除するデータを選択してください");
-      return;
+      return false;
     }
-    if (!window.confirm(`${selectedIds.size}件のデータを削除しますか？`)) return;
+    if (!window.confirm(`${ids.size}件のデータを削除しますか？`)) return false;
     setBusy(true);
     try {
       if (!demoMode && services) {
-        for (const group of chunk([...selectedIds])) {
+        for (const group of chunk([...ids])) {
           const batch = writeBatch(services.db);
           group.forEach((id) => batch.delete(doc(services.db, "matches", id)));
           await batch.commit();
         }
       }
-      setAllRecords((records) =>
-        records.filter((record) => !selectedIds.has(record.id)),
-      );
-      notify(`${selectedIds.size}件を削除しました`);
-      setSelectedIds(new Set());
+      setAllRecords((records) => records.filter((record) => !ids.has(record.id)));
+      notify(`${ids.size}件を削除しました`);
+      return true;
     } catch {
       notify("削除に失敗しました");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -608,6 +606,16 @@ export default function Home() {
             onBack={() => setView("main")}
           />
         )}
+        {view === "browse" && (
+          <BrowseView
+            records={sortedRecords}
+            seasons={seasonOptions}
+            registrants={registrants}
+            hunters={hunterOptions}
+            loading={loadingRecords || !recordsLoaded}
+            onBack={() => setView("main")}
+          />
+        )}
         {view === "add" && (
           <AddView
             settings={settings}
@@ -619,17 +627,11 @@ export default function Home() {
         )}
         {view === "delete" && (
           <DeleteView
-            records={filteredRecords}
+            records={sortedRecords}
+            seasons={seasonOptions}
             registrants={registrants}
-            selectedIds={selectedIds}
-            setSelectedIds={setSelectedIds}
-            date={deleteDate}
-            setDate={setDeleteDate}
-            time={deleteTime}
-            setTime={setDeleteTime}
-            registrant={deleteUser}
-            setRegistrant={setDeleteUser}
-            onDelete={deleteSelected}
+            hunters={hunterOptions}
+            onDelete={deleteRecords}
             busy={busy}
             onBack={() => setView("main")}
           />
@@ -650,7 +652,13 @@ export default function Home() {
           className={view === "stats" ? "active" : ""}
           onClick={() => setView("stats")}
         >
-          <span>▦</span>データ閲覧
+          <span>▦</span>Ban集計
+        </button>
+        <button
+          className={view === "browse" ? "active" : ""}
+          onClick={() => setView("browse")}
+        >
+          <span>☰</span>データ閲覧
         </button>
         <button
           className={view === "delete" ? "active" : ""}
@@ -864,6 +872,14 @@ function MainView({
   registerAfterSearch: () => void;
   busy: boolean;
 }) {
+  // 予測を実行し直したら、開いていた根拠の一覧は閉じる。
+  const [openHunter, setOpenHunter] = useState("");
+  const [shownPrediction, setShownPrediction] = useState(prediction);
+  if (shownPrediction !== prediction) {
+    setShownPrediction(prediction);
+    setOpenHunter("");
+  }
+
   return (
     <>
       <div className="page-heading">
@@ -879,7 +895,7 @@ function MainView({
             <span>01</span>
             <div>
               <h2>マップ</h2>
-              <p>使用マップを1つ選択</p>
+              <p>使用マップを1つ選択（絞り込みではなく加点要素）</p>
             </div>
             {selectedMap && <b className="done">選択済</b>}
           </div>
@@ -943,7 +959,7 @@ function MainView({
               {loadingRecords
                 ? "データを読み込み中..."
                 : selectedMap
-                  ? `全${totalRecords}件（該当マップ${mapRecordCount}件）から算出`
+                  ? `全${totalRecords}件から算出（マップ一致${mapRecordCount}件は加点）`
                   : "マップを選択してください"}
             </small>
           </button>
@@ -978,23 +994,42 @@ function MainView({
                   ))}
                 </div>
               )}
+              <p className="evidence-hint">
+                ハンターの行をクリックすると、その予測に使われたデータとスコアの内訳を表示します。
+              </p>
               <div className="prediction-head">
                 <span>ハンター</span>
                 <span>予測率</span>
                 <span>使用データ数</span>
               </div>
               <ol className="prediction-list">
-                {prediction.rows.map((row, index) => (
-                  <li key={row.hunter}>
-                    <span className="rank">{String(index + 1).padStart(2, "0")}</span>
-                    <strong>{row.hunter}</strong>
-                    <div className="probability">
-                      <span style={{ width: `${row.probability}%` }} />
-                    </div>
-                    <b>{row.probability}%</b>
-                    <small>{row.count}件</small>
-                  </li>
-                ))}
+                {prediction.rows.map((row, index) => {
+                  const open = openHunter === row.hunter;
+                  return (
+                    <li key={row.hunter} className={open ? "open" : ""}>
+                      <button
+                        type="button"
+                        className="prediction-row"
+                        aria-expanded={open}
+                        onClick={() => setOpenHunter(open ? "" : row.hunter)}
+                      >
+                        <span className="rank">
+                          {String(index + 1).padStart(2, "0")}
+                        </span>
+                        <strong>{row.hunter}</strong>
+                        <div className="probability">
+                          <span style={{ width: `${row.probability}%` }} />
+                        </div>
+                        <b>{row.probability}%</b>
+                        <small>{row.count}件</small>
+                        <span className="row-caret" aria-hidden="true">
+                          {open ? "▲" : "▼"}
+                        </span>
+                      </button>
+                      {open && <EvidencePanel row={row} />}
+                    </li>
+                  );
+                })}
               </ol>
             </>
           ) : (
@@ -1127,7 +1162,7 @@ function StatsView({
   return (
     <AuxiliaryPage
       eyebrow="DATA INSIGHT"
-      title="Banデータ閲覧"
+      title="Ban集計"
       description="登録済みデータを集計し、BAN傾向とハンター使用率をシーズン別に確認します。"
       onBack={onBack}
     >
@@ -1314,79 +1349,318 @@ function AddView({
   );
 }
 
+/**
+ * 予測の根拠一覧。
+ * 「そのハンターの全データ」ではなく、予測アルゴリズムが実際に採用したデータだけを
+ * スコア（重み）と採用理由つきで表示する。
+ */
+function EvidencePanel({ row }: { row: PredictionRow }) {
+  return (
+    <div className="evidence">
+      <div className="evidence-head">
+        <strong>{row.hunter} の予測に使用したデータ</strong>
+        <span>
+          {row.contributions.length}件 ／ 合計スコア <b>{row.score}</b>
+        </span>
+      </div>
+      <div className="table-wrap evidence-table">
+        <table>
+          <thead>
+            <tr>
+              <th>登録日時</th>
+              <th>シーズン</th>
+              <th>登録ユーザー</th>
+              <th>マップ</th>
+              <th>Ban1</th>
+              <th>Ban2</th>
+              <th>Ban3</th>
+              <th>ハンター</th>
+              <th>スコア</th>
+            </tr>
+          </thead>
+          <tbody>
+            {row.contributions.map((item) => (
+              // 採用理由は横スクロールせず読めるよう、行の下へ全幅で表示する。
+              <Fragment key={item.record.id}>
+                <tr className="evidence-row">
+                  <td>{formatDateTimeShort(item.record.registeredAt)}</td>
+                  <td>{item.record.season}</td>
+                  <td>{item.record.registeredByName}</td>
+                  <td className={item.mapMatched ? "cell-hit" : ""}>
+                    {item.record.map}
+                  </td>
+                  <td>{item.record.ban1}</td>
+                  <td>{item.record.ban2}</td>
+                  <td>{item.record.ban3}</td>
+                  <td>
+                    <strong>{item.record.hunter}</strong>
+                  </td>
+                  <td className="cell-score">
+                    <b>{item.score}</b>
+                    <small>{item.share}%</small>
+                  </td>
+                </tr>
+                <tr className="reason-row">
+                  <td colSpan={9}>
+                    <span className="reason-tag">採用理由</span>
+                    {item.reason}
+                  </td>
+                </tr>
+              </Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * データ閲覧・削除で共通の検索バー。
+ * 条件を何も指定せずに検索した場合は全件検索として扱う。
+ */
+function RecordSearchBar({
+  seasons,
+  registrants,
+  hunters,
+  draft,
+  setDraft,
+  onSearch,
+  onClear,
+  count,
+}: {
+  seasons: string[];
+  registrants: { uid: string; name: string; count: number }[];
+  hunters: string[];
+  draft: RecordQuery;
+  setDraft: (value: RecordQuery) => void;
+  onSearch: () => void;
+  onClear: () => void;
+  count: number;
+}) {
+  return (
+    <div className="filter-bar">
+      <label>
+        シーズン
+        <select
+          value={draft.season}
+          onChange={(event) =>
+            setDraft({ ...draft, season: event.target.value })
+          }
+        >
+          <option value={ALL_SEASONS}>すべて</option>
+          {seasons.map((season) => (
+            <option key={season} value={season}>{season}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        登録ユーザー
+        <select
+          value={draft.registrant}
+          onChange={(event) =>
+            setDraft({ ...draft, registrant: event.target.value })
+          }
+        >
+          <option value={ALL_USERS}>全ユーザー</option>
+          {registrants.map((item) => (
+            <option key={item.uid} value={item.uid}>
+              {item.name}（{item.count}件）
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        ピックされたハンター
+        <select
+          value={draft.hunter}
+          onChange={(event) =>
+            setDraft({ ...draft, hunter: event.target.value })
+          }
+        >
+          <option value={ALL_HUNTERS}>すべて</option>
+          {hunters.map((hunter) => (
+            <option key={hunter} value={hunter}>{hunter}</option>
+          ))}
+        </select>
+      </label>
+      <button className="primary-button filter-search" onClick={onSearch}>
+        検索
+      </button>
+      <button className="secondary-button" onClick={onClear}>
+        条件をクリア
+      </button>
+      <span className="record-count">{count}件</span>
+    </div>
+  );
+}
+
+/** データ閲覧・削除で共通の列。行頭の列（No. やチェックボックス）は呼び出し側が足す。 */
+function RecordCells({ record }: { record: MatchRecord }) {
+  return (
+    <>
+      <td>{formatDateTime(record.registeredAt)}</td>
+      <td>{record.season}</td>
+      <td>{record.registeredByName}</td>
+      <td>{record.map}</td>
+      <td>{record.ban1}</td>
+      <td>{record.ban2}</td>
+      <td>{record.ban3}</td>
+      <td>
+        <strong>{record.hunter}</strong>
+      </td>
+    </>
+  );
+}
+
+const RECORD_COLUMNS = [
+  "登録日時",
+  "シーズン",
+  "登録ユーザー",
+  "マップ",
+  "Ban1",
+  "Ban2",
+  "Ban3",
+  "ピックされたハンター",
+];
+
+/** 検索条件を「入力中の値」と「適用済みの値」に分けて持つ。検索ボタンで確定する。 */
+function useRecordSearch(records: MatchRecord[], onApply?: () => void) {
+  const [draft, setDraft] = useState<RecordQuery>(EMPTY_RECORD_QUERY);
+  const [applied, setApplied] = useState<RecordQuery>(EMPTY_RECORD_QUERY);
+
+  const results = useMemo(
+    () => filterRecords(records, applied),
+    [applied, records],
+  );
+
+  const search = () => {
+    setApplied(draft);
+    onApply?.();
+  };
+  const clear = () => {
+    setDraft(EMPTY_RECORD_QUERY);
+    setApplied(EMPTY_RECORD_QUERY);
+    onApply?.();
+  };
+
+  return { draft, setDraft, results, search, clear };
+}
+
+function BrowseView({
+  records,
+  seasons,
+  registrants,
+  hunters,
+  loading,
+  onBack,
+}: {
+  records: MatchRecord[];
+  seasons: string[];
+  registrants: { uid: string; name: string; count: number }[];
+  hunters: string[];
+  loading: boolean;
+  onBack: () => void;
+}) {
+  const { draft, setDraft, results, search, clear } = useRecordSearch(records);
+
+  return (
+    <AuxiliaryPage
+      eyebrow="DATA BROWSER"
+      title="データ閲覧"
+      description="登録されているすべての試合データを一覧で確認できます。シーズン・登録ユーザー・ピックされたハンターで絞り込めます。"
+      onBack={onBack}
+    >
+      <section className="panel delete-panel">
+        <RecordSearchBar
+          seasons={seasons}
+          registrants={registrants}
+          hunters={hunters}
+          draft={draft}
+          setDraft={setDraft}
+          onSearch={search}
+          onClear={clear}
+          count={results.length}
+        />
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>No.</th>
+                {RECORD_COLUMNS.map((column) => (
+                  <th key={column}>{column}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((record, index) => (
+                <tr key={record.id}>
+                  <td>{index + 1}</td>
+                  <RecordCells record={record} />
+                </tr>
+              ))}
+              {!results.length && (
+                <tr>
+                  <td colSpan={RECORD_COLUMNS.length + 1} className="empty-table">
+                    {loading
+                      ? "共有データを読み込んでいます..."
+                      : "条件に一致するデータがありません"}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </AuxiliaryPage>
+  );
+}
+
 function DeleteView({
   records,
+  seasons,
   registrants,
-  selectedIds,
-  setSelectedIds,
-  date,
-  setDate,
-  time,
-  setTime,
-  registrant,
-  setRegistrant,
+  hunters,
   onDelete,
   busy,
   onBack,
 }: {
   records: MatchRecord[];
-  registrants: { uid: string; name: string }[];
-  selectedIds: Set<string>;
-  setSelectedIds: (ids: Set<string>) => void;
-  date: string;
-  setDate: (value: string) => void;
-  time: string;
-  setTime: (value: string) => void;
-  registrant: string;
-  setRegistrant: (value: string) => void;
-  onDelete: () => void;
+  seasons: string[];
+  registrants: { uid: string; name: string; count: number }[];
+  hunters: string[];
+  onDelete: (ids: Set<string>) => Promise<boolean>;
   busy: boolean;
   onBack: () => void;
 }) {
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // 検索し直したときは選択を解除し、表示中のデータだけが削除対象になるようにする。
+  const { draft, setDraft, results, search, clear } = useRecordSearch(
+    records,
+    () => setSelectedIds(new Set()),
+  );
+
   const allSelected =
-    records.length > 0 && records.every((record) => selectedIds.has(record.id));
+    results.length > 0 && results.every((record) => selectedIds.has(record.id));
 
   return (
     <AuxiliaryPage
       eyebrow="DATA CONTROL"
       title="登録データの削除"
-      description="登録日時と登録ユーザーで絞り込み、複数件をまとめて削除できます。"
+      description="シーズン・登録ユーザー・ピックされたハンターで絞り込み、検索結果に表示されたデータだけをまとめて削除できます。"
       onBack={onBack}
     >
       <section className="panel delete-panel">
-        <div className="filter-bar">
-          <label>
-            登録日
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-          </label>
-          <label>
-            登録時間
-            <input type="time" value={time} onChange={(e) => setTime(e.target.value)} />
-          </label>
-          <label>
-            登録ユーザー
-            <select
-              value={registrant}
-              onChange={(e) => setRegistrant(e.target.value)}
-            >
-              <option value={ALL_USERS}>全ユーザー</option>
-              {registrants.map((item) => (
-                <option key={item.uid} value={item.uid}>{item.name}</option>
-              ))}
-            </select>
-          </label>
-          <button
-            className="secondary-button"
-            onClick={() => {
-              setDate("");
-              setTime("");
-              setRegistrant(ALL_USERS);
-            }}
-          >
-            条件をクリア
-          </button>
-          <span className="record-count">{records.length}件</span>
-        </div>
+        <RecordSearchBar
+          seasons={seasons}
+          registrants={registrants}
+          hunters={hunters}
+          draft={draft}
+          setDraft={setDraft}
+          onSearch={search}
+          onClear={clear}
+          count={results.length}
+        />
         <div className="table-wrap">
           <table>
             <thead>
@@ -1400,22 +1674,19 @@ function DeleteView({
                       setSelectedIds(
                         allSelected
                           ? new Set()
-                          : new Set(records.map((record) => record.id)),
+                          : new Set(results.map((record) => record.id)),
                       )
                     }
                   />
                 </th>
                 <th>No.</th>
-                <th>登録日時</th>
-                <th>登録者</th>
-                <th>マップ</th>
-                <th>BAN</th>
-                <th>ハンター</th>
-                <th>シーズン</th>
+                {RECORD_COLUMNS.map((column) => (
+                  <th key={column}>{column}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {records.map((record, index) => (
+              {results.map((record, index) => (
                 <tr key={record.id}>
                   <td>
                     <input
@@ -1431,17 +1702,14 @@ function DeleteView({
                     />
                   </td>
                   <td>{index + 1}</td>
-                  <td>{formatDateTime(record.registeredAt)}</td>
-                  <td>{record.registeredByName}</td>
-                  <td>{record.map}</td>
-                  <td>{record.bans.join(" / ")}</td>
-                  <td><strong>{record.hunter}</strong></td>
-                  <td>{record.season}</td>
+                  <RecordCells record={record} />
                 </tr>
               ))}
-              {!records.length && (
+              {!results.length && (
                 <tr>
-                  <td colSpan={8} className="empty-table">条件に一致するデータがありません</td>
+                  <td colSpan={RECORD_COLUMNS.length + 2} className="empty-table">
+                    条件に一致するデータがありません
+                  </td>
                 </tr>
               )}
             </tbody>
@@ -1452,7 +1720,9 @@ function DeleteView({
           <button
             className="danger-button"
             disabled={!selectedIds.size || busy}
-            onClick={onDelete}
+            onClick={async () => {
+              if (await onDelete(selectedIds)) setSelectedIds(new Set());
+            }}
           >
             選択したデータを削除
           </button>
@@ -1898,7 +2168,7 @@ function SettingsView({
               ))}
             </select>
             <small>
-              Ban率順にすると、Banデータ閲覧のランキングと同じ順序で検索画面へ表示します。
+              Ban率順にすると、Ban集計のランキングと同じ順序で検索画面へ表示します。
             </small>
           </label>
           <div className="master-counts">

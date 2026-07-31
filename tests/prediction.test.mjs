@@ -183,6 +183,101 @@ describe("予測アルゴリズム", () => {
     );
   });
 
+  it("マップで絞り込まず、マップ違いのBAN完全一致も採用する", () => {
+    const data = sample();
+    const result = prediction.buildPrediction(
+      data,
+      { map: "永眠町", bans: ["機械技師", "オフェンス", "祭司"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    // マップはどのデータとも一致しないが、BANが一致するデータは採用される。
+    // BANが1人も一致しない 5（湖景村）だけが除外される。
+    assert.equal(result.exactCount, 0);
+    const used = result.rows.flatMap((row) =>
+      row.contributions.map((item) => item.record.id),
+    );
+    assert.deepEqual(used.sort(), ["1", "2", "3", "4"]);
+  });
+
+  it("Ban完全一致はマップ違いでも、Ban一部一致のマップ一致より高く評価する", () => {
+    const data = [
+      match("full", "湖景村", ["機械技師", "オフェンス", "祭司"], "イタカ", "S43"),
+      match("partial", "軍需工場", ["機械技師", "オフェンス", "空軍"], "破輪", "S43"),
+    ];
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["機械技師", "オフェンス", "祭司"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    assert.equal(result.rows[0].hunter, "イタカ");
+    assert.ok(result.rows[0].score > result.rows[1].score);
+  });
+
+  it("Banを指定した検索では、Ban一致なしのデータを評価対象から外す", () => {
+    const data = [
+      match("hit", "湖景村", ["機械技師"], "イタカ", "S43"),
+      match("miss", "軍需工場", ["空軍", "医師"], "破輪", "S43"),
+    ];
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["機械技師"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    // マップが一致していても、BANが1人も一致しない「破輪」は使われない。
+    assert.deepEqual(
+      result.rows.map((row) => row.hunter),
+      ["イタカ"],
+    );
+    assert.equal(result.total, 1);
+  });
+
+  it("採用されたデータをスコアと理由つきで返す", () => {
+    const data = sample();
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["祭司", "オフェンス", "機械技師"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    const top = result.rows[0];
+    assert.equal(top.hunter, "イタカ");
+    // 予測に使われた件数と、根拠として返る件数は必ず一致する。
+    assert.equal(top.contributions.length, top.count);
+    // スコアの高い順に並ぶ。
+    top.contributions.forEach((item, index) => {
+      if (index > 0) {
+        assert.ok(item.score <= top.contributions[index - 1].score);
+      }
+    });
+    const first = top.contributions[0];
+    assert.ok(first.score > 0);
+    assert.match(first.reason, /BAN3一致/);
+    assert.match(first.reason, /マップ一致/);
+    assert.equal(first.mapMatched, true);
+    assert.equal(first.banMatchCount, 3);
+    // 割合の合計はおおむね100%になる。
+    const share = top.contributions.reduce((total, item) => total + item.share, 0);
+    assert.ok(Math.abs(share - 100) < 1);
+  });
+
+  it("マップ違いのデータには採用理由へマップ不一致を残す", () => {
+    const data = sample();
+    const result = prediction.buildPrediction(
+      data,
+      { map: "赤の教会", bans: ["機械技師", "オフェンス", "祭司"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    const itaka = result.rows.find((row) => row.hunter === "イタカ");
+    assert.ok(itaka);
+    itaka.contributions.forEach((item) => {
+      assert.match(item.reason, /マップ不一致/);
+    });
+  });
+
   it("ファクターごとに既定値が定義されている", () => {
     const config = constants.defaultPredictionConfig(3);
     prediction.PREDICTION_FACTORS.forEach((factor) => {
@@ -227,6 +322,72 @@ describe("集計", () => {
     assert.equal(byMap[0].totalMatches, 3);
     assert.equal(byMap[0].rows[0].name, "イタカ");
     assert.equal(byMap[0].rows[0].count, 2);
+  });
+
+  it("条件なしの検索は全件を返す", () => {
+    const data = sample();
+    assert.equal(
+      stats.filterRecords(data, stats.EMPTY_RECORD_QUERY).length,
+      data.length,
+    );
+  });
+
+  it("シーズン・登録ユーザー・ハンターを組み合わせて絞り込む", () => {
+    const data = [
+      ...sample(),
+      {
+        ...match("6", "軍需工場", ["機械技師"], "イタカ", "S43"),
+        registeredByUid: "u2",
+        registeredByName: "ユーザーB",
+      },
+    ];
+    const query = (patch) => ({ ...stats.EMPTY_RECORD_QUERY, ...patch });
+
+    assert.equal(stats.filterRecords(data, query({ season: "S43" })).length, 4);
+    assert.equal(
+      stats.filterRecords(data, query({ registrant: "u2" })).length,
+      1,
+    );
+    assert.equal(
+      stats.filterRecords(data, query({ hunter: "イタカ" })).length,
+      3,
+    );
+    assert.equal(
+      stats.filterRecords(data, query({ registrant: "u2", hunter: "イタカ" }))
+        .length,
+      1,
+    );
+    assert.equal(
+      stats.filterRecords(data, query({ registrant: "u1", hunter: "漁師" }))
+        .length,
+      1,
+    );
+  });
+
+  it("データを登録しているユーザーだけを件数つきで返す", () => {
+    const data = [
+      ...sample(),
+      {
+        ...match("6", "軍需工場", ["機械技師"], "イタカ", "S43"),
+        registeredByUid: "u2",
+        registeredByName: "ユーザーB",
+      },
+    ];
+    const registrants = stats.collectRegistrants(data);
+    assert.deepEqual(
+      registrants.map((item) => [item.uid, item.count]),
+      [
+        ["u1", 5],
+        ["u2", 1],
+      ],
+    );
+  });
+
+  it("ピック実績のあるハンターだけをマスターの並び順で返す", () => {
+    assert.deepEqual(
+      stats.collectHunters(sample(), ["漁師", "雑貨商", "イタカ", "破輪"]),
+      ["漁師", "雑貨商", "イタカ", "女王蜂"],
+    );
   });
 
   it("Ban率順の並び替えは同率なら登録順を保つ", () => {
