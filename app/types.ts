@@ -52,11 +52,29 @@ export type AppSettings = {
 /** 名称変更の記録。キーは「変更前（元）の名称」、値は「変更後の名称」。 */
 export type RenamePlan = Record<MasterKind, Record<string, string>>;
 
+/**
+ * 予測へ実際に採用された登録データ1件ぶんの内訳。
+ * 「どの過去データを、どんな理由で、どれだけ重く使ったか」を利用者へ提示する。
+ */
+export type PredictionContribution = {
+  record: MatchRecord;
+  /** このデータが予測へ与えたスコア（重み） */
+  score: number;
+  /** そのハンターの合計スコアに占める割合（0〜100） */
+  share: number;
+  banMatchCount: number;
+  mapMatched: boolean;
+  /** 採用理由（例:「BAN3一致 +30 / マップ一致 +6 / 希少Ban補正 ×1.2」） */
+  reason: string;
+};
+
 export type PredictionRow = {
   hunter: string;
   count: number;
   probability: number;
   score: number;
+  /** 予測率の計算に使われたデータのみ。スコアの高い順。 */
+  contributions: PredictionContribution[];
 };
 
 /** 予測に使われたデータの内訳（例: 「BAN3一致 + マップ一致」が18件） */
@@ -96,4 +114,17 @@ export type MapHunterStats = {
   rows: RankingRow[];
 };
 
-export type ViewName = "main" | "stats" | "delete" | "update" | "add";
+export type ViewName =
+  | "main"
+  | "stats"
+  | "browse"
+  | "delete"
+  | "update"
+  | "add";
+
+/** データ閲覧・削除画面で共通に使う検索条件。値は番兵（__all__）で「指定なし」を表す。 */
+export type RecordQuery = {
+  season: string;
+  registrant: string;
+  hunter: string;
+};

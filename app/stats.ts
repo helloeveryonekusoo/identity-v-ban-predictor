@@ -1,10 +1,11 @@
-import { ALL_SEASONS, BAN_NONE } from "./constants";
+import { ALL_HUNTERS, ALL_SEASONS, ALL_USERS, BAN_NONE } from "./constants";
 import type {
   BanOrderMode,
   MapHunterStats,
   MatchRecord,
   RankingResult,
   RankingRow,
+  RecordQuery,
 } from "./types";
 
 export function normalizeBans(bans: string[]) {
@@ -124,15 +125,74 @@ export function collectSeasons(
   return [...masterSeasons, ...extras];
 }
 
-/** 登録者ドロップダウン用。表示名で重複を除いた一覧。 */
+/** 登録ユーザーを一意に表す値。uid が無い旧データは表示名で代用する。 */
+export function registrantKey(record: MatchRecord) {
+  return record.registeredByUid || record.registeredByName;
+}
+
+/**
+ * 登録ユーザードロップダウン用。
+ * アカウントの有無ではなく「1件以上データを登録しているユーザー」だけを返す。
+ */
 export function collectRegistrants(records: MatchRecord[]) {
-  const byUid = new Map<string, string>();
+  const byUid = new Map<string, { name: string; count: number }>();
   records.forEach((record) => {
-    const key = record.registeredByUid || record.registeredByName;
+    const key = registrantKey(record);
     if (!key) return;
-    if (!byUid.has(key)) byUid.set(key, record.registeredByName || "不明");
+    const entry = byUid.get(key);
+    if (entry) entry.count += 1;
+    else byUid.set(key, { name: record.registeredByName || "不明", count: 1 });
   });
   return [...byUid.entries()]
-    .map(([uid, name]) => ({ uid, name }))
+    .map(([uid, value]) => ({ uid, name: value.name, count: value.count }))
     .sort((a, b) => a.name.localeCompare(b.name, "ja"));
+}
+
+/**
+ * ハンタードロップダウン用。
+ * 実際にピックされた実績のあるハンターだけを、マスターの並び順で返す。
+ */
+export function collectHunters(
+  records: MatchRecord[],
+  masterHunters: string[],
+): string[] {
+  const used = new Set(records.map((record) => record.hunter).filter(Boolean));
+  const ordered = masterHunters.filter((hunter) => used.has(hunter));
+  const extras = [...used]
+    .filter((hunter) => !masterHunters.includes(hunter))
+    .sort((a, b) => a.localeCompare(b, "ja"));
+  return [...ordered, ...extras];
+}
+
+/** すべての条件が「指定なし」なら全件検索になる。 */
+export const EMPTY_RECORD_QUERY: RecordQuery = {
+  season: ALL_SEASONS,
+  registrant: ALL_USERS,
+  hunter: ALL_HUNTERS,
+};
+
+/**
+ * データ閲覧・削除画面の検索。
+ * シーズン／登録ユーザー／ピックされたハンターを組み合わせて絞り込む。
+ * 未指定（番兵値）の条件は無視するため、条件なしなら全件を返す。
+ */
+export function filterRecords(
+  records: MatchRecord[],
+  query: RecordQuery,
+): MatchRecord[] {
+  return records.filter((record) => {
+    if (query.season !== ALL_SEASONS && record.season !== query.season) {
+      return false;
+    }
+    if (
+      query.registrant !== ALL_USERS &&
+      registrantKey(record) !== query.registrant
+    ) {
+      return false;
+    }
+    if (query.hunter !== ALL_HUNTERS && record.hunter !== query.hunter) {
+      return false;
+    }
+    return true;
+  });
 }

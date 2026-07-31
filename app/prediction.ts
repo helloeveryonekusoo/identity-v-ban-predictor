@@ -4,6 +4,7 @@ import type {
   AppSettings,
   FactorConfig,
   MatchRecord,
+  PredictionContribution,
   PredictionResult,
   PredictionRow,
   PredictionTier,
@@ -39,12 +40,28 @@ export type FactorContext = {
  * add      … 基礎スコアへの加算（一致の強さ）
  * multiply … 合計スコアへの倍率（補正）
  * exclude  … このデータを予測から除外する
+ * note     … 採用理由として利用者へ表示する短い説明
  */
 export type FactorResult = {
   add?: number;
   multiply?: number;
   exclude?: boolean;
+  note?: string;
 };
+
+/** 採用理由の表示用。小数は2桁までに丸め、加算値には符号を付ける。 */
+function round2(value: number) {
+  return Math.round(value * 100) / 100;
+}
+
+function signed(value: number) {
+  const rounded = round2(value);
+  return rounded >= 0 ? `+${rounded}` : `${rounded}`;
+}
+
+function times(value: number) {
+  return `×${round2(value)}`;
+}
 
 export type FactorParamSpec = {
   key: string;
@@ -100,14 +117,22 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
           ),
       },
     ],
-    score: ({ banMatchCount, config }) => ({
-      add: config.series.weights?.[banMatchCount] ?? 0,
-    }),
+    score: ({ banMatchCount, config }) => {
+      const add = config.series.weights?.[banMatchCount] ?? 0;
+      return {
+        add,
+        note:
+          banMatchCount > 0
+            ? `BAN${banMatchCount}一致 ${signed(add)}`
+            : "BAN一致なし",
+      };
+    },
   },
   {
     id: "mapMatch",
     label: "マップ補正",
-    description: "マップが一致したデータへ重みを加算します。",
+    description:
+      "マップが一致したデータへ重みを加算します。マップは絞り込み条件ではなく、加点要素として働きます。",
     params: [
       {
         key: "weight",
@@ -118,9 +143,11 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
       },
     ],
     series: [],
-    score: ({ mapMatched, config }) => ({
-      add: mapMatched ? (config.params.weight ?? 0) : 0,
-    }),
+    score: ({ mapMatched, config }) => {
+      if (!mapMatched) return { add: 0, note: "マップ不一致" };
+      const add = config.params.weight ?? 0;
+      return { add, note: `マップ一致 ${signed(add)}` };
+    },
   },
   {
     id: "rareBan",
@@ -145,7 +172,14 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
           (total, ban) => total + (1 - Math.min(1, banRate.get(ban) ?? 0)),
           0,
         ) / matchedBans.length;
-      return { multiply: 1 + (config.params.maxBonus ?? 0) * rarity };
+      const multiply = 1 + (config.params.maxBonus ?? 0) * rarity;
+      return {
+        multiply,
+        note:
+          Math.abs(multiply - 1) < 0.005
+            ? undefined
+            : `希少Ban補正 ${times(multiply)}`,
+      };
     },
   },
   {
@@ -170,9 +204,16 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
           }),
       },
     ],
-    score: ({ seasonAge, config }) => ({
-      multiply: config.series.weights?.[seasonAge] ?? 1,
-    }),
+    score: ({ seasonAge, config }) => {
+      const multiply = config.series.weights?.[seasonAge] ?? 1;
+      return {
+        multiply,
+        note:
+          Math.abs(multiply - 1) < 0.005
+            ? undefined
+            : `シーズン補正 ${times(multiply)}`,
+      };
+    },
   },
 ];
 
@@ -220,7 +261,44 @@ type ScoredRecord = {
   relevance: number;
   banMatchCount: number;
   mapMatched: boolean;
+  /** 各ファクターが返した採用理由。 */
+  notes: string[];
 };
+
+function round1(value: number) {
+  return Math.round(value * 10) / 10;
+}
+
+/**
+ * ハンター1体ぶんの「採用されたデータ」一覧を、影響の大きい順に組み立てる。
+ * usingFallback（類似データ無し）のときは、一致ではなく全体傾向として使われた旨を示す。
+ */
+function buildContributions(
+  items: ScoredRecord[],
+  totalScore: number,
+  usingFallback: boolean,
+): PredictionContribution[] {
+  return [...items]
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.banMatchCount - a.banMatchCount ||
+        Number(b.mapMatched) - Number(a.mapMatched),
+    )
+    .map((item) => {
+      const notes = usingFallback
+        ? ["全体傾向として使用", ...item.notes]
+        : item.notes;
+      return {
+        record: item.record,
+        score: round1(item.score),
+        share: totalScore > 0 ? round1((item.score / totalScore) * 100) : 0,
+        banMatchCount: item.banMatchCount,
+        mapMatched: item.mapMatched,
+        reason: notes.length ? notes.join(" / ") : "基礎スコアのみ",
+      };
+    });
+}
 
 function scoreRecord(
   record: MatchRecord,
@@ -248,6 +326,7 @@ function scoreRecord(
   let add = 0;
   let multiply = 1;
   let excluded = false;
+  const notes: string[] = [];
 
   PREDICTION_FACTORS.forEach((factor) => {
     const factorConfig = config.factors[factor.id] ?? EMPTY_FACTOR_CONFIG;
@@ -256,6 +335,7 @@ function scoreRecord(
     if (result.exclude) excluded = true;
     add += result.add ?? 0;
     multiply *= result.multiply ?? 1;
+    if (result.note) notes.push(result.note);
   });
 
   const score = excluded
@@ -268,11 +348,16 @@ function scoreRecord(
     relevance: excluded ? 0 : add,
     banMatchCount: matchedBans.length,
     mapMatched,
+    notes,
   };
 }
 
 /**
- * 類似データも含めてスコアリングし、ハンターごとの予測率（合計100%）を返す。
+ * マップでは一切絞り込まず、登録されている全データを対象にスコアリングし、
+ * ハンターごとの予測率（合計100%）を返す。
+ * マップは検索条件ではなく加点要素として扱うため、マップが違うデータでも
+ * BANが一致していれば予測に採用される。
+ * BANを指定した検索では、BANが1人も一致しないデータは評価対象外とする。
  * 完全一致データが無い場合も、一致度の低いデータを重み付けして必ず結果を返す。
  */
 export function buildPrediction(
@@ -291,11 +376,19 @@ export function buildPrediction(
   if (!records.length) return empty;
 
   const queryBans = new Set(normalizeBans(query.bans));
+  // マップでの絞り込みは行わない。全データをスコアリングの対象にする。
   const scored = records.map((record) =>
     scoreRecord(record, query, settings, banRate, queryBans),
   );
 
-  const matched = scored.filter((item) => item.relevance > 0 && item.score > 0);
+  // BANを指定しているときは、BANが1人も一致しないデータを評価対象外にする。
+  // （マップだけが一致したデータがBAN1一致より上に来るのを防ぐ）
+  const matched = scored.filter(
+    (item) =>
+      item.relevance > 0 &&
+      item.score > 0 &&
+      (queryBans.size === 0 || item.banMatchCount > 0),
+  );
   let used = matched;
   let usingFallback = false;
 
@@ -310,13 +403,17 @@ export function buildPrediction(
     used = scored.map((item) => ({ ...item, score: 1 }));
   }
 
-  const byHunter = new Map<string, { score: number; count: number }>();
+  const byHunter = new Map<
+    string,
+    { score: number; count: number; items: ScoredRecord[] }
+  >();
   used.forEach((item) => {
     const hunter = item.record.hunter;
     if (!hunter) return;
-    const bucket = byHunter.get(hunter) ?? { score: 0, count: 0 };
+    const bucket = byHunter.get(hunter) ?? { score: 0, count: 0, items: [] };
     bucket.score += item.score;
     bucket.count += 1;
+    bucket.items.push(item);
     byHunter.set(hunter, bucket);
   });
 
@@ -333,8 +430,9 @@ export function buildPrediction(
   const rows: PredictionRow[] = entries.map(([hunter, value], index) => ({
     hunter,
     count: value.count,
-    score: Math.round(value.score * 10) / 10,
+    score: round1(value.score),
     probability: percentages[index],
+    contributions: buildContributions(value.items, value.score, usingFallback),
   }));
 
   const tierMap = new Map<string, PredictionTier>();

@@ -475,39 +475,63 @@ input:focus {
   list-style: none;
   padding: 0;
   margin: 0;
-  max-height: 300px;
+  max-height: 460px;
   overflow: auto;
 }
 
 .prediction-list li {
-  min-height: 54px;
-  display: grid;
-  grid-template-columns: 30px minmax(90px, 1fr) 90px 45px 45px;
-  align-items: center;
-  gap: 9px;
   border-top: 1px solid #edf0eb;
 }
 
-.prediction-list li:first-child {
+.prediction-row {
+  width: 100%;
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: 30px minmax(90px, 1fr) 90px 45px 45px 16px;
+  align-items: center;
+  gap: 9px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.prediction-list li:first-child .prediction-row {
   background: linear-gradient(90deg, rgba(217, 255, 67, 0.2), transparent 65%);
 }
 
-.prediction-list .rank {
+.prediction-row:hover {
+  background: #f4f7ec;
+}
+
+.prediction-list li.open .prediction-row {
+  background: #eff3e4;
+}
+
+.row-caret {
+  color: var(--muted);
+  text-align: right;
+  font-size: 8px;
+}
+
+.prediction-row .rank {
   color: #a4aaa1;
   font-family: Georgia, serif;
   font-size: 12px;
 }
 
-.prediction-list strong {
+.prediction-row strong {
   font-size: 13px;
 }
 
-.prediction-list b {
+.prediction-row > b {
   text-align: right;
   font-size: 17px;
 }
 
-.prediction-list small {
+.prediction-row > small {
   color: var(--muted);
   text-align: right;
   font-size: 10px;
@@ -1118,11 +1142,11 @@ th input {
     grid-template-columns: 1fr;
   }
 
-  .prediction-list li {
-    grid-template-columns: 26px minmax(80px, 1fr) 42px 40px;
+  .prediction-row {
+    grid-template-columns: 26px minmax(80px, 1fr) 42px 40px 14px;
   }
 
-  .prediction-list .probability {
+  .prediction-row .probability {
     display: none;
   }
 
@@ -1661,4 +1685,113 @@ th input {
     align-items: stretch;
     flex-direction: column;
   }
+}
+
+/* ---------- データ閲覧 / 検索根拠の表示 ---------- */
+
+/* ナビが5項目になったので、狭い画面では折り返す。 */
+.utility-nav {
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: calc(100vw - 24px);
+}
+
+.filter-search {
+  min-height: 46px;
+  padding: 0 24px;
+}
+
+.filter-bar .record-count {
+  align-self: center;
+}
+
+.evidence-hint {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.evidence {
+  padding: 4px 0 16px;
+}
+
+.evidence-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 2px;
+}
+
+.evidence-head strong {
+  font-size: 12px;
+}
+
+.evidence-head span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.evidence-head b {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.evidence-table {
+  max-height: 260px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.evidence-table table {
+  font-size: 10px;
+}
+
+.evidence-table td {
+  padding: 9px 10px;
+}
+
+/* マップが一致して加点されたセルを目立たせる。 */
+.cell-hit {
+  background: #f2f7df;
+  font-weight: 800;
+}
+
+.cell-score {
+  white-space: nowrap;
+  text-align: right;
+}
+
+.cell-score b {
+  font-size: 12px;
+}
+
+.cell-score small {
+  margin-left: 6px;
+  color: var(--muted);
+}
+
+/* 採用理由の行。データ行と1組に見えるよう、間の罫線を消す。 */
+.evidence-table .evidence-row td {
+  border-bottom: 0;
+}
+
+.evidence-table .reason-row td {
+  padding: 0 10px 10px;
+  border-top: 0;
+  white-space: normal;
+  color: #4c5349;
+  line-height: 1.6;
+}
+
+.reason-tag {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #eef1e7;
+  color: #6b7263;
+  font-size: 9px;
+  font-weight: 800;
 }
