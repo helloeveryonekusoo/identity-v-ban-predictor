@@ -39,11 +39,13 @@ import {
   DEFAULT_SETTINGS,
   DEMO_MATCHES,
   DEMO_SEASONS,
+  HUNTER_BAN_SLOTS,
   MASTER_LABELS,
   MAX_BAN_SLOTS,
   defaultPredictionConfig,
   normalizeSettings,
   resizeBanMatchWeights,
+  splitSettings,
 } from "./constants";
 import { loadFirebaseServices, type FirebaseServices } from "./firebase";
 import { PREDICTION_FACTORS, buildPrediction } from "./prediction";
@@ -93,6 +95,7 @@ const emptyPrediction: PredictionResult = {
   exactCount: 0,
   basis: "",
   tiers: [],
+  excludedHunters: [],
 };
 
 const demoRecords: MatchRecord[] = DEMO_MATCHES.map((row, index) => ({
@@ -228,6 +231,9 @@ export default function Home() {
   const [bans, setBans] = useState<string[]>(
     Array(DEFAULT_SETTINGS.banSlots).fill(BAN_NONE),
   );
+  const [hunterBans, setHunterBans] = useState<string[]>(
+    Array(HUNTER_BAN_SLOTS).fill(BAN_NONE),
+  );
   const [actualHunter, setActualHunter] = useState("");
   const [prediction, setPrediction] =
     useState<PredictionResult>(emptyPrediction);
@@ -288,13 +294,23 @@ export default function Home() {
       });
       return;
     }
-    getDoc(doc(services.db, "settings", "global"))
-      .then((snapshot) => {
-        if (snapshot.exists()) setSettings(normalizeSettings(snapshot.data()));
+    // マスターデータは全員で共有、それ以外の設定はユーザーごとに読み込む。
+    // ユーザー設定がまだ無いときは、共有ドキュメントの値をシステム既定として使う。
+    Promise.all([
+      getDoc(doc(services.db, "settings", "global")),
+      user
+        ? getDoc(doc(services.db, "userSettings", user.uid))
+        : Promise.resolve(null),
+    ])
+      .then(([globalSnapshot, userSnapshot]) => {
+        const shared = globalSnapshot.exists() ? globalSnapshot.data() : {};
+        const personal =
+          userSnapshot && userSnapshot.exists() ? userSnapshot.data() : {};
+        setSettings(normalizeSettings({ ...shared, ...personal }));
       })
       .catch(() => notify("設定の読み込みに失敗しました"));
     queueMicrotask(() => void loadRecords());
-  }, [demoMode, loadRecords, notify, services, signedIn]);
+  }, [demoMode, loadRecords, notify, services, signedIn, user]);
 
   useEffect(() => {
     queueMicrotask(() =>
@@ -306,6 +322,20 @@ export default function Home() {
       ),
     );
   }, [settings.banSlots]);
+
+  // 設定に登録されたデフォルトハンターBANを、検索画面の初期選択にする。
+  // 未登録なら「BANなし」のまま（＝何も選択されていない状態）。
+  useEffect(() => {
+    const defaults = settings.defaultHunterBans;
+    queueMicrotask(() =>
+      setHunterBans(
+        Array.from(
+          { length: HUNTER_BAN_SLOTS },
+          (_, index) => defaults[index] ?? BAN_NONE,
+        ),
+      ),
+    );
+  }, [settings.defaultHunterBans]);
 
   const banRateIndex = useMemo(() => buildBanRateIndex(allRecords), [allRecords]);
 
@@ -339,6 +369,11 @@ export default function Home() {
     return new Set(active).size !== active.length;
   }, [bans]);
 
+  const duplicateHunterBan = useMemo(() => {
+    const active = hunterBans.filter((hunter) => hunter !== BAN_NONE);
+    return new Set(active).size !== active.length;
+  }, [hunterBans]);
+
   const chooseMap = (map: string) => {
     setSelectedMap(map);
     setHasSearched(false);
@@ -355,10 +390,19 @@ export default function Home() {
       notify("同じサバイバーは複数選択できません");
       return;
     }
+    if (duplicateHunterBan) {
+      notify("同じハンターは複数選択できません");
+      return;
+    }
     setPrediction(
       buildPrediction(
         allRecords,
-        { map: selectedMap, bans, season: settings.currentSeason },
+        {
+          map: selectedMap,
+          bans,
+          hunterBans,
+          season: settings.currentSeason,
+        },
         settings,
         banRateIndex,
       ),
@@ -440,6 +484,13 @@ export default function Home() {
     if (await saveMatch(selectedMap, bans, actualHunter)) {
       setSelectedMap("");
       setBans(Array(settings.banSlots).fill(BAN_NONE));
+      // ハンターBANは設定した初期値へ戻す（試合ごとに選び直す手間を減らす）。
+      setHunterBans(
+        Array.from(
+          { length: HUNTER_BAN_SLOTS },
+          (_, index) => settings.defaultHunterBans[index] ?? BAN_NONE,
+        ),
+      );
       setActualHunter("");
       setPrediction(emptyPrediction);
       setHasSearched(false);
@@ -504,7 +555,12 @@ export default function Home() {
             await batch.commit();
           }
         }
-        await setDoc(doc(services.db, "settings", "global"), normalized);
+        // マスターデータだけを共有ドキュメントへ、それ以外は本人のドキュメントへ。
+        const { shared, user: personal } = splitSettings(normalized);
+        await setDoc(doc(services.db, "settings", "global"), shared);
+        if (user) {
+          await setDoc(doc(services.db, "userSettings", user.uid), personal);
+        }
       }
       setAllRecords((records) => applyRenamesToRecords(records, plan));
       setSettings(normalized);
@@ -513,7 +569,7 @@ export default function Home() {
       notify(
         renames
           ? `設定を更新し、${renames}件の名称を登録データへ反映しました`
-          : "システム設定を更新しました",
+          : "設定を更新しました（基本設定はあなた専用です）",
       );
       setView("main");
       return true;
@@ -586,6 +642,9 @@ export default function Home() {
             bans={bans}
             setBans={setBans}
             duplicateBan={duplicateBan}
+            hunterBans={hunterBans}
+            setHunterBans={setHunterBans}
+            duplicateHunterBan={duplicateHunterBan}
             loadingRecords={loadingRecords}
             totalRecords={allRecords.length}
             mapRecordCount={mapRecordCount}
@@ -843,6 +902,9 @@ function MainView({
   bans,
   setBans,
   duplicateBan,
+  hunterBans,
+  setHunterBans,
+  duplicateHunterBan,
   loadingRecords,
   totalRecords,
   mapRecordCount,
@@ -861,6 +923,9 @@ function MainView({
   bans: string[];
   setBans: (value: string[]) => void;
   duplicateBan: boolean;
+  hunterBans: string[];
+  setHunterBans: (value: string[]) => void;
+  duplicateHunterBan: boolean;
   loadingRecords: boolean;
   totalRecords: number;
   mapRecordCount: number;
@@ -949,10 +1014,51 @@ function MainView({
           {duplicateBan && (
             <p className="form-error">同じサバイバーが重複しています</p>
           )}
+
+          <div className="divider" />
+
+          <div className="step-head">
+            <span>03</span>
+            <div>
+              <h2>BANハンター</h2>
+              <p>選んだハンターは予測結果から除外されます</p>
+            </div>
+            <b className="ban-count">
+              {normalizeBans(hunterBans).length}/{HUNTER_BAN_SLOTS}
+            </b>
+          </div>
+          <div className="ban-row">
+            {hunterBans.map((hunter, index) => (
+              <label key={index}>
+                <small>BAN {index + 1}</small>
+                <select
+                  value={hunter}
+                  onChange={(event) => {
+                    const next = [...hunterBans];
+                    next[index] = event.target.value;
+                    setHunterBans(next);
+                  }}
+                >
+                  <option>{BAN_NONE}</option>
+                  {settings.hunters.map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </select>
+              </label>
+            ))}
+          </div>
+          {duplicateHunterBan && (
+            <p className="form-error">同じハンターが重複しています</p>
+          )}
           <button
             className="primary-button search-button"
             onClick={runPrediction}
-            disabled={!selectedMap || duplicateBan || loadingRecords}
+            disabled={
+              !selectedMap ||
+              duplicateBan ||
+              duplicateHunterBan ||
+              loadingRecords
+            }
           >
             <span>予測を実行</span>
             <small>
@@ -984,6 +1090,12 @@ function MainView({
           ) : prediction.rows.length ? (
             <>
               <div className="fallback-note">{prediction.basis}</div>
+              {prediction.excludedHunters.length > 0 && (
+                <div className="excluded-note">
+                  BANにより除外:{" "}
+                  <b>{prediction.excludedHunters.join("・")}</b>
+                </div>
+              )}
               {prediction.tiers.length > 0 && (
                 <div className="tier-row">
                   {prediction.tiers.map((tier) => (
@@ -995,7 +1107,8 @@ function MainView({
                 </div>
               )}
               <p className="evidence-hint">
-                ハンターの行をクリックすると、その予測に使われたデータとスコアの内訳を表示します。
+                順位はまず一致度で決まり、同じ一致度の中だけで件数と補正が効きます。
+                ハンターの行をクリックすると、使われたデータとスコアの内訳を表示します。
               </p>
               <div className="prediction-head">
                 <span>ハンター</span>
@@ -1016,7 +1129,10 @@ function MainView({
                         <span className="rank">
                           {String(index + 1).padStart(2, "0")}
                         </span>
-                        <strong>{row.hunter}</strong>
+                        <strong>
+                          {row.hunter}
+                          <small className="match-tag">{row.matchLabel}</small>
+                        </strong>
                         <div className="probability">
                           <span style={{ width: `${row.probability}%` }} />
                         </div>
@@ -1897,6 +2013,201 @@ function MasterEditor({
   );
 }
 
+/** よくBANするハンターを最大3体まで登録し、検索画面の初期選択にする。 */
+function HunterBanDefaults({
+  draft,
+  setDraft,
+}: {
+  draft: AppSettings;
+  setDraft: (value: AppSettings) => void;
+}) {
+  const slots = Array.from(
+    { length: HUNTER_BAN_SLOTS },
+    (_, index) => draft.defaultHunterBans[index] ?? BAN_NONE,
+  );
+  const duplicate =
+    new Set(slots.filter((h) => h !== BAN_NONE)).size !==
+    slots.filter((h) => h !== BAN_NONE).length;
+
+  const update = (index: number, value: string) => {
+    const next = [...slots];
+    next[index] = value;
+    setDraft({
+      ...draft,
+      defaultHunterBans: next.filter((hunter) => hunter !== BAN_NONE),
+    });
+  };
+
+  return (
+    <div className="setting-block">
+      <div className="setting-block-head">
+        <h3>デフォルトハンターBan設定</h3>
+        <p>
+          毎回よくBANするハンターを最大{HUNTER_BAN_SLOTS}体まで登録できます。
+          検索画面を開いたときに、ここで登録したハンターが最初から選択された状態になります。
+          未登録なら何も選択されていない状態で始まります。
+        </p>
+      </div>
+      <div className="ban-row">
+        {slots.map((hunter, index) => (
+          <label key={index}>
+            <small>BAN {index + 1}</small>
+            <select
+              value={hunter}
+              onChange={(event) => update(index, event.target.value)}
+            >
+              <option>{BAN_NONE}</option>
+              {draft.hunters.map((item) => (
+                <option key={item}>{item}</option>
+              ))}
+            </select>
+          </label>
+        ))}
+      </div>
+      {duplicate && (
+        <p className="form-error">同じハンターが重複しています</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 希少Ban補正の対象サバイバーと重みを選ぶ。
+ * ファクター定義の picks / params をそのまま読むので、
+ * 将来ほかの特殊補正を足しても同じ形で並べられる。
+ */
+function RareBanSettings({
+  draft,
+  setDraft,
+}: {
+  draft: AppSettings;
+  setDraft: (value: AppSettings) => void;
+}) {
+  const adjustFactors = PREDICTION_FACTORS.filter(
+    (factor) => factor.kind === "adjust" && factor.picks.length > 0,
+  );
+
+  const patchFactor = (id: string, patch: Partial<FactorConfig>) => {
+    setDraft({
+      ...draft,
+      prediction: {
+        ...draft.prediction,
+        factors: {
+          ...draft.prediction.factors,
+          [id]: { ...draft.prediction.factors[id], ...patch },
+        },
+      },
+    });
+  };
+
+  return (
+    <>
+      {adjustFactors.map((factor) => {
+        const config = draft.prediction.factors[factor.id];
+        if (!config) return null;
+        return (
+          <div key={factor.id} className="setting-block">
+            <div className="setting-block-head">
+              <h3>{factor.label}設定</h3>
+              <p>{factor.description}</p>
+              <label className="toggle inline-toggle">
+                <input
+                  type="checkbox"
+                  checked={config.enabled}
+                  onChange={(event) =>
+                    patchFactor(factor.id, { enabled: event.target.checked })
+                  }
+                />
+                <span>{config.enabled ? "ON" : "OFF"}</span>
+              </label>
+            </div>
+
+            {config.enabled && (
+              <>
+                {factor.params.map((spec) => (
+                  <label key={spec.key} className="param-field">
+                    {spec.label}
+                    <input
+                      type="number"
+                      min={spec.min}
+                      max={spec.max}
+                      step={spec.step}
+                      value={config.params[spec.key] ?? 0}
+                      onChange={(event) =>
+                        patchFactor(factor.id, {
+                          params: {
+                            ...config.params,
+                            [spec.key]: Number(event.target.value) || 0,
+                          },
+                        })
+                      }
+                    />
+                    {spec.hint && <small>{spec.hint}</small>}
+                  </label>
+                ))}
+
+                {factor.picks.map((spec) => {
+                  const selected = new Set(config.picks[spec.key] ?? []);
+                  const options = spec.options(draft);
+                  return (
+                    <div key={spec.key} className="pick-field">
+                      <p className="series-label">
+                        {spec.label}
+                        <b>{selected.size}人選択中</b>
+                        {spec.hint && <small>{spec.hint}</small>}
+                      </p>
+                      <div className="pick-grid">
+                        {options.map((name) => (
+                          <label
+                            key={name}
+                            className={selected.has(name) ? "picked" : ""}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selected.has(name)}
+                              onChange={() => {
+                                const next = new Set(selected);
+                                if (next.has(name)) next.delete(name);
+                                else next.add(name);
+                                patchFactor(factor.id, {
+                                  picks: {
+                                    ...config.picks,
+                                    // マスターの並び順を保って保存する。
+                                    [spec.key]: options.filter((item) =>
+                                      next.has(item),
+                                    ),
+                                  },
+                                });
+                              }}
+                            />
+                            {name}
+                          </label>
+                        ))}
+                      </div>
+                      {selected.size > 0 && (
+                        <button
+                          className="secondary-button clear-picks"
+                          onClick={() =>
+                            patchFactor(factor.id, {
+                              picks: { ...config.picks, [spec.key]: [] },
+                            })
+                          }
+                        >
+                          選択をすべて解除
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 function PredictionEditor({
   draft,
   setDraft,
@@ -1925,8 +2236,11 @@ function PredictionEditor({
         <div>
           <h2>予測設定</h2>
           <p>
-            1件ごとのスコアは<code>（基礎スコア ＋ 加算値の合計）× 補正倍率</code>
-            で決まり、ハンター別の合計スコアの比率がそのまま予測率（合計100%）になります。
+            順位はまず<code>一致度（マップ＋BANサバイバー）</code>
+            で決まります。ハンターごとに最も一致度の高いデータだけを採用し、
+            <b>同じ一致度の中でのみ</b>件数と補正（希少Ban・シーズン）が効きます。
+            件数の影響には自動で上限が掛かるため、Ban2一致の大量データが
+            Ban3一致を追い抜くことはありません。
           </p>
         </div>
         <button
@@ -1963,6 +2277,30 @@ function PredictionEditor({
         <small>どの条件にも一致しないデータへ与える最低スコアです。</small>
       </label>
 
+      <label className="base-weight">
+        件数の影響度
+        <input
+          type="number"
+          min={0}
+          max={1}
+          step={0.05}
+          value={config.countWeight}
+          onChange={(event) =>
+            setDraft({
+              ...draft,
+              prediction: {
+                ...config,
+                countWeight: Number(event.target.value) || 0,
+              },
+            })
+          }
+        />
+        <small>
+          同じ一致度の中で、件数の多さをどれだけ加点するかです（0〜1）。
+          一致度が逆転しないよう、実際の適用値には自動で上限が掛かります。
+        </small>
+      </label>
+
       {PREDICTION_FACTORS.map((factor) => {
         const factorConfig = config.factors[factor.id];
         if (!factorConfig) return null;
@@ -1973,8 +2311,18 @@ function PredictionEditor({
           >
             <header>
               <div>
-                <h3>{factor.label}</h3>
+                <h3>
+                  {factor.label}
+                  <span className={`kind-tag ${factor.kind}`}>
+                    {factor.kind === "match" ? "一致度" : "同一致度内の補正"}
+                  </span>
+                </h3>
                 <p>{factor.description}</p>
+                {factor.picks.length > 0 && (
+                  <p className="factor-link">
+                    対象の選択は「基本設定」タブで行います。
+                  </p>
+                )}
               </div>
               <label className="toggle">
                 <input
@@ -2123,6 +2471,11 @@ function SettingsView({
       {section === "basic" && (
         <section className="panel settings-summary wide-panel">
           <h2>基本設定</h2>
+          <p className="personal-note">
+            この画面の設定は<b>あなた専用</b>として保存されます。
+            他のユーザーの予測や表示には影響しません。
+            サバイバー・ハンター・マップ・シーズンの一覧と試合データは全員で共有です。
+          </p>
           <label>
             現在のシーズン
             <select
@@ -2171,6 +2524,10 @@ function SettingsView({
               Ban率順にすると、Ban集計のランキングと同じ順序で検索画面へ表示します。
             </small>
           </label>
+
+          <HunterBanDefaults draft={draft} setDraft={setDraft} />
+          <RareBanSettings draft={draft} setDraft={setDraft} />
+
           <div className="master-counts">
             <span><b>{draft.survivors.length}</b>サバイバー</span>
             <span><b>{draft.hunters.length}</b>ハンター</span>

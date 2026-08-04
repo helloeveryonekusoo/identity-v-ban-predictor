@@ -3,6 +3,8 @@ import type {
   BanOrderMode,
   MasterKind,
   PredictionConfig,
+  SharedSettings,
+  UserSettings,
 } from "./types";
 
 export const DEFAULT_MAPS = [
@@ -132,6 +134,9 @@ export const SEASON_AGE_BUCKETS = 4;
 
 export const MAX_BAN_SLOTS = 6;
 
+/** サバイバー側がBANできるハンターの数。ゲームのルールに合わせて3体固定。 */
+export const HUNTER_BAN_SLOTS = 3;
+
 /** BAN一致数ごとの既定重み。index が一致数。銀行スロット数に合わせて伸縮させる。 */
 const DEFAULT_BAN_MATCH_WEIGHTS = [0, 3, 10, 30, 45, 60, 80];
 
@@ -153,11 +158,13 @@ export function defaultBanMatchWeights(banSlots: number): number[] {
 export function defaultPredictionConfig(banSlots = 3): PredictionConfig {
   return {
     baseWeight: 1,
+    countWeight: 0.5,
     factors: {
       banMatch: {
         enabled: true,
         params: {},
         series: { weights: defaultBanMatchWeights(banSlots) },
+        picks: {},
       },
       // 既定値は「Ban3一致 > Ban2一致+マップ > Ban2一致 > Ban1一致+マップ」の
       // 順になるよう、BAN一致数の重み差より小さい値にしてある。
@@ -165,30 +172,45 @@ export function defaultPredictionConfig(banSlots = 3): PredictionConfig {
         enabled: true,
         params: { weight: 6 },
         series: {},
+        picks: {},
       },
+      // 対象サバイバーは利用者が「基本設定」で選ぶ。既定は未選択＝補正なし。
       rareBan: {
         enabled: true,
-        params: { maxBonus: 0.5 },
+        params: { bonus: 0.5 },
         series: {},
+        picks: { survivors: [] },
       },
       season: {
         enabled: true,
         params: {},
         series: { weights: [1, 0.8, 0.6, 0.4] },
+        picks: {},
       },
     },
   };
 }
 
-export const DEFAULT_SETTINGS: AppSettings = {
+/** ログイン中のユーザーへ最初に適用する設定。 */
+export const DEFAULT_USER_SETTINGS: UserSettings = {
+  currentSeason: DEFAULT_SEASON,
+  banOrderMode: "registered",
+  defaultHunterBans: [],
+  prediction: defaultPredictionConfig(3),
+};
+
+/** 全ユーザーで共有するマスターデータの初期値。 */
+export const DEFAULT_SHARED_SETTINGS: SharedSettings = {
   maps: [...DEFAULT_MAPS],
   survivors: [...DEFAULT_SURVIVORS],
   hunters: [...DEFAULT_HUNTERS],
   seasons: [DEFAULT_SEASON],
   banSlots: 3,
-  currentSeason: DEFAULT_SEASON,
-  banOrderMode: "registered",
-  prediction: defaultPredictionConfig(3),
+};
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  ...DEFAULT_SHARED_SETTINGS,
+  ...DEFAULT_USER_SETTINGS,
 };
 
 function uniqueStrings(value: unknown, fallback: string[]): string[] {
@@ -219,6 +241,20 @@ function numberSeries(
   return Array.from({ length }, (_, index) =>
     numberOr(source[index], fallback[index] ?? fallback[fallback.length - 1] ?? 0),
   );
+}
+
+/** 選択リスト（希少Ban対象など）。空の選択も正当な値なので fallback を返さない。 */
+function pickList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  value.forEach((item) => {
+    const name = typeof item === "string" ? item.trim() : "";
+    if (!name || seen.has(name)) return;
+    seen.add(name);
+    result.push(name);
+  });
+  return result;
 }
 
 /**
@@ -252,6 +288,7 @@ export function normalizeSettings(raw: unknown): AppSettings {
     const stored = (rawFactors[id] ?? {}) as Record<string, unknown>;
     const storedParams = (stored.params ?? {}) as Record<string, unknown>;
     const storedSeries = (stored.series ?? {}) as Record<string, unknown>;
+    const storedPicks = (stored.picks ?? {}) as Record<string, unknown>;
 
     factors[id] = {
       enabled:
@@ -268,6 +305,9 @@ export function normalizeSettings(raw: unknown): AppSettings {
           numberSeries(storedSeries[key], value.length, value),
         ]),
       ),
+      picks: Object.fromEntries(
+        Object.keys(fallback.picks).map((key) => [key, pickList(storedPicks[key])]),
+      ),
     };
   });
 
@@ -279,19 +319,55 @@ export function normalizeSettings(raw: unknown): AppSettings {
       enabled: stored.enabled !== false,
       params: (stored.params ?? {}) as Record<string, number>,
       series: (stored.series ?? {}) as Record<string, number[]>,
+      picks: (stored.picks ?? {}) as Record<string, string[]>,
     };
   });
+
+  const hunters = uniqueStrings(data.hunters, DEFAULT_SETTINGS.hunters);
 
   return {
     maps: uniqueStrings(data.maps, DEFAULT_SETTINGS.maps),
     survivors: uniqueStrings(data.survivors, DEFAULT_SETTINGS.survivors),
-    hunters: uniqueStrings(data.hunters, DEFAULT_SETTINGS.hunters),
+    hunters,
     seasons: orderedSeasons,
     banSlots,
     currentSeason,
     banOrderMode:
       data.banOrderMode === "banRate" ? "banRate" : "registered",
-    prediction: { baseWeight: numberOr(rawPrediction.baseWeight, 1), factors },
+    // マスターから消えたハンターは既定BANから落とす。
+    defaultHunterBans: pickList(data.defaultHunterBans)
+      .filter((hunter) => hunters.includes(hunter))
+      .slice(0, HUNTER_BAN_SLOTS),
+    prediction: {
+      baseWeight: numberOr(rawPrediction.baseWeight, 1),
+      countWeight: Math.min(
+        1,
+        Math.max(0, numberOr(rawPrediction.countWeight, 0.5)),
+      ),
+      factors,
+    },
+  };
+}
+
+/** 保存時に、共有マスターとユーザー設定へ切り分ける。 */
+export function splitSettings(settings: AppSettings): {
+  shared: SharedSettings;
+  user: UserSettings;
+} {
+  return {
+    shared: {
+      maps: settings.maps,
+      survivors: settings.survivors,
+      hunters: settings.hunters,
+      seasons: settings.seasons,
+      banSlots: settings.banSlots,
+    },
+    user: {
+      currentSeason: settings.currentSeason,
+      banOrderMode: settings.banOrderMode,
+      defaultHunterBans: settings.defaultHunterBans,
+      prediction: settings.prediction,
+    },
   };
 }
 

@@ -278,6 +278,166 @@ describe("予測アルゴリズム", () => {
     });
   });
 
+  it("件数がどれだけ多くても、一致度の高いハンターを追い抜かない", () => {
+    // 破輪は Ban2一致 のデータを50件、イタカは Ban3一致 を1件だけ持つ。
+    const data = [
+      match("itaka", "軍需工場", ["機械技師", "オフェンス", "祭司"], "イタカ", "S43"),
+      ...Array.from({ length: 50 }, (_, i) =>
+        match(`ha-${i}`, "軍需工場", ["機械技師", "オフェンス", "空軍"], "破輪", "S43"),
+      ),
+    ];
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["機械技師", "オフェンス", "祭司"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    assert.equal(result.rows[0].hunter, "イタカ");
+    assert.ok(result.rows[0].probability > result.rows[1].probability);
+    // 件数で選ばれたわけではないことを示す。
+    assert.equal(result.rows[0].count, 1);
+    assert.equal(result.rows[1].count, 50);
+  });
+
+  it("同じ一致度の中では件数の多いほうが上に来る", () => {
+    const data = [
+      match("a1", "軍需工場", ["機械技師", "オフェンス"], "イタカ", "S43"),
+      match("a2", "軍需工場", ["機械技師", "オフェンス"], "イタカ", "S43"),
+      match("b1", "軍需工場", ["機械技師", "オフェンス"], "破輪", "S43"),
+    ];
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["機械技師", "オフェンス"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    assert.equal(result.rows[0].hunter, "イタカ");
+    assert.equal(result.rows[0].count, 2);
+  });
+
+  it("ハンターごとに最も一致度の高いデータだけを採用する", () => {
+    const data = [
+      match("best", "軍需工場", ["機械技師", "オフェンス", "祭司"], "イタカ", "S43"),
+      match("worse", "湖景村", ["機械技師"], "イタカ", "S43"),
+    ];
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["機械技師", "オフェンス", "祭司"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    const itaka = result.rows.find((row) => row.hunter === "イタカ");
+    assert.equal(itaka.count, 1);
+    assert.deepEqual(
+      itaka.contributions.map((item) => item.record.id),
+      ["best"],
+    );
+    assert.equal(itaka.matchLabel, "BAN3一致 + マップ一致");
+  });
+
+  it("BANしたハンターを結果から完全に除外し、残りで100%にする", () => {
+    const data = sample();
+    const result = prediction.buildPrediction(
+      data,
+      {
+        map: "軍需工場",
+        bans: ["機械技師", "オフェンス", "祭司"],
+        hunterBans: ["イタカ", "BANなし", "BANなし"],
+      },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    assert.equal(result.rows.some((row) => row.hunter === "イタカ"), false);
+    assert.deepEqual(result.excludedHunters, ["イタカ"]);
+    assert.equal(
+      result.rows.reduce((total, row) => total + row.probability, 0),
+      100,
+    );
+    // 除外されたデータは根拠一覧にも出てこない。
+    const used = result.rows.flatMap((row) =>
+      row.contributions.map((item) => item.record.hunter),
+    );
+    assert.equal(used.includes("イタカ"), false);
+  });
+
+  it("ハンターBANは一致度の計算には影響しない", () => {
+    const data = sample();
+    const query = { map: "軍需工場", bans: ["機械技師", "オフェンス", "祭司"] };
+    const plain = prediction.buildPrediction(
+      data,
+      query,
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    const banned = prediction.buildPrediction(
+      data,
+      { ...query, hunterBans: ["女王蜂"] },
+      baseSettings(),
+      stats.buildBanRateIndex(data),
+    );
+    const scoreOf = (result, hunter) =>
+      result.rows.find((row) => row.hunter === hunter)?.score;
+    // 除外していないハンターのスコアは変わらない（％だけが再計算される）。
+    assert.equal(scoreOf(plain, "イタカ"), scoreOf(banned, "イタカ"));
+    assert.equal(banned.rows.some((row) => row.hunter === "女王蜂"), false);
+  });
+
+  it("希少Ban補正は設定したサバイバーにだけ掛かる", () => {
+    const data = [
+      match("rare", "軍需工場", ["機械技師", "呪術師"], "イタカ", "S43"),
+      match("plain", "軍需工場", ["機械技師", "オフェンス"], "破輪", "S43"),
+    ];
+    const query = { map: "軍需工場", bans: ["機械技師", "呪術師", "オフェンス"] };
+
+    const off = baseSettings();
+    off.prediction.factors.rareBan.picks.survivors = [];
+    const offResult = prediction.buildPrediction(
+      data,
+      query,
+      off,
+      stats.buildBanRateIndex(data),
+    );
+
+    const on = baseSettings();
+    on.prediction.factors.rareBan.picks.survivors = ["呪術師"];
+    const onResult = prediction.buildPrediction(
+      data,
+      query,
+      on,
+      stats.buildBanRateIndex(data),
+    );
+
+    const find = (result, hunter) =>
+      result.rows.find((row) => row.hunter === hunter);
+    // 呪術師を選ぶと、それを含むデータのスコアだけが上がる。
+    assert.ok(find(onResult, "イタカ").score > find(offResult, "イタカ").score);
+    assert.equal(find(onResult, "破輪").score, find(offResult, "破輪").score);
+    assert.match(
+      find(onResult, "イタカ").contributions[0].reason,
+      /希少Ban補正（呪術師）/,
+    );
+  });
+
+  it("希少Ban補正は一致度をまたいで順位を変えない", () => {
+    // 破輪は Ban2一致 だが希少Ban対象を持つ。イタカは Ban3一致 で対象なし。
+    const data = [
+      match("itaka", "湖景村", ["機械技師", "オフェンス", "祭司"], "イタカ", "S43"),
+      ...Array.from({ length: 30 }, (_, i) =>
+        match(`ha-${i}`, "軍需工場", ["呪術師", "祭司"], "破輪", "S43"),
+      ),
+    ];
+    const settings = baseSettings();
+    settings.prediction.factors.rareBan.picks.survivors = ["呪術師"];
+    settings.prediction.factors.rareBan.params.bonus = 3;
+    const result = prediction.buildPrediction(
+      data,
+      { map: "軍需工場", bans: ["機械技師", "オフェンス", "祭司", "呪術師"] },
+      settings,
+      stats.buildBanRateIndex(data),
+    );
+    assert.equal(result.rows[0].hunter, "イタカ");
+  });
+
   it("ファクターごとに既定値が定義されている", () => {
     const config = constants.defaultPredictionConfig(3);
     prediction.PREDICTION_FACTORS.forEach((factor) => {
@@ -459,6 +619,72 @@ describe("設定の正規化", () => {
       banSlots: 6,
     });
     assert.equal(settings.prediction.factors.banMatch.series.weights.length, 7);
+  });
+
+  it("希少Ban対象を保持し、未設定なら空で読み込む", () => {
+    const stored = constants.normalizeSettings({
+      ...constants.DEFAULT_SETTINGS,
+      prediction: {
+        ...constants.defaultPredictionConfig(3),
+        factors: {
+          ...constants.defaultPredictionConfig(3).factors,
+          rareBan: {
+            enabled: true,
+            params: { bonus: 0.8 },
+            series: {},
+            picks: { survivors: ["呪術師", "呪術師", "画家"] },
+          },
+        },
+      },
+    });
+    // 重複は取り除かれる。
+    assert.deepEqual(stored.prediction.factors.rareBan.picks.survivors, [
+      "呪術師",
+      "画家",
+    ]);
+    assert.equal(stored.prediction.factors.rareBan.params.bonus, 0.8);
+
+    const fresh = constants.normalizeSettings({});
+    assert.deepEqual(fresh.prediction.factors.rareBan.picks.survivors, []);
+  });
+
+  it("デフォルトハンターBANはマスターに在るものだけを3体まで保持する", () => {
+    const settings = constants.normalizeSettings({
+      hunters: ["イタカ", "破輪", "女王蜂", "漁師"],
+      defaultHunterBans: ["女王蜂", "存在しないハンター", "破輪", "漁師", "イタカ"],
+    });
+    assert.deepEqual(settings.defaultHunterBans, ["女王蜂", "破輪", "漁師"]);
+  });
+
+  it("共有マスターとユーザー設定を分けて書き出す", () => {
+    const settings = constants.normalizeSettings({
+      ...constants.DEFAULT_SETTINGS,
+      currentSeason: "S43",
+      seasons: ["S43"],
+      banOrderMode: "banRate",
+      defaultHunterBans: ["歯医者"],
+    });
+    const { shared, user } = constants.splitSettings(settings);
+
+    // 全員で共有するのはマスターデータだけ。
+    assert.deepEqual(Object.keys(shared).sort(), [
+      "banSlots",
+      "hunters",
+      "maps",
+      "seasons",
+      "survivors",
+    ]);
+    // 基本設定・予測の重みは本人だけのもの。
+    assert.deepEqual(Object.keys(user).sort(), [
+      "banOrderMode",
+      "currentSeason",
+      "defaultHunterBans",
+      "prediction",
+    ]);
+    assert.equal(user.banOrderMode, "banRate");
+    assert.deepEqual(user.defaultHunterBans, ["歯医者"]);
+    assert.equal("prediction" in shared, false);
+    assert.equal("survivors" in user, false);
   });
 
   it("未知のファクター設定を失わない", () => {

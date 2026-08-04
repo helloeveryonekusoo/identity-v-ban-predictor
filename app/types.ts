@@ -24,30 +24,47 @@ export type BanOrderMode = "registered" | "banRate";
  * 予測ファクター1件ぶんの設定値。
  * params  … 単一の数値パラメータ（例: マップ一致の重み）
  * series  … 可変長の数値パラメータ（例: BAN一致数ごとの重み）
+ * picks   … 対象として選んだ名称の一覧（例: 希少Ban扱いにするサバイバー）
  */
 export type FactorConfig = {
   enabled: boolean;
   params: Record<string, number>;
   series: Record<string, number[]>;
+  picks: Record<string, string[]>;
 };
 
 export type PredictionConfig = {
   /** どのファクターにも当てはまらないデータへ与える基礎スコア */
   baseWeight: number;
+  /**
+   * 同じ一致度の中で、件数の多さをどれだけ加点するか（0〜1）。
+   * 一致度の高いデータが件数で逆転されないよう、実際の適用値は自動で上限が掛かる。
+   */
+  countWeight: number;
   factors: Record<string, FactorConfig>;
 };
 
-export type AppSettings = {
+/** 全ユーザーで共有するマスターデータ。 */
+export type SharedSettings = {
   maps: string[];
   survivors: string[];
   hunters: string[];
   /** 新しい順に並べる。index 0 が最新シーズン。 */
   seasons: string[];
   banSlots: number;
+};
+
+/** ログイン中のユーザーだけに保存される設定。他ユーザーへは一切影響しない。 */
+export type UserSettings = {
   currentSeason: string;
   banOrderMode: BanOrderMode;
+  /** 検索画面を開いたときに最初から選ばれているハンターBAN（最大3体）。 */
+  defaultHunterBans: string[];
   prediction: PredictionConfig;
 };
+
+/** 画面が扱う設定の合成ビュー。保存時に共有ぶんとユーザーぶんへ分けて書き込む。 */
+export type AppSettings = SharedSettings & UserSettings;
 
 /** 名称変更の記録。キーは「変更前（元）の名称」、値は「変更後の名称」。 */
 export type RenamePlan = Record<MasterKind, Record<string, string>>;
@@ -73,6 +90,10 @@ export type PredictionRow = {
   count: number;
   probability: number;
   score: number;
+  /** このハンターが持つ最も高い一致度の値。順位はまずこの値で決まる。 */
+  matchValue: number;
+  /** 最も高い一致度のラベル（例:「BAN3一致 + マップ一致」） */
+  matchLabel: string;
   /** 予測率の計算に使われたデータのみ。スコアの高い順。 */
   contributions: PredictionContribution[];
 };
@@ -93,6 +114,8 @@ export type PredictionResult = {
   /** 使用データの中で最も一致度が高かった層のラベル */
   basis: string;
   tiers: PredictionTier[];
+  /** ハンターBANで検索結果から除外したハンター名 */
+  excludedHunters: string[];
 };
 
 export type RankingRow = {
