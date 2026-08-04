@@ -1381,8 +1381,14 @@ th input {
   padding: 4px 8px 0;
 }
 
+/* 希少Banのサバイバー一覧が入るので、基本設定は広めに取る。 */
 .wide-panel {
-  width: min(720px, 100%);
+  width: min(980px, 100%);
+}
+
+/* ただし単体のドロップダウンは伸ばしすぎない。 */
+.settings-summary > label {
+  max-width: 420px;
 }
 
 .editor-hint {
@@ -1794,4 +1800,188 @@ th input {
   color: #6b7263;
   font-size: 9px;
   font-weight: 800;
+}
+
+/* ---------- 一致度優先の予測 / 希少Ban設定 / ハンターBAN ---------- */
+
+.excluded-note {
+  padding: 9px 11px;
+  margin-top: 8px;
+  background: #fdeceb;
+  color: #8d3630;
+  border-radius: 6px;
+  font-size: 10px;
+}
+
+.excluded-note b {
+  font-size: 11px;
+}
+
+/* ハンター名の右に、そのハンターの最高一致度を小さく添える。 */
+.match-tag {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+.kind-tag {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 800;
+  vertical-align: middle;
+}
+
+.kind-tag.match {
+  background: var(--ink);
+  color: var(--acid);
+}
+
+.kind-tag.adjust {
+  background: #eef1e7;
+  color: #6b7263;
+}
+
+.factor-link {
+  margin-top: 6px !important;
+  color: #75802a !important;
+  font-weight: 700;
+}
+
+.personal-note {
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  background: #f2f5ea;
+  border-left: 4px solid #8a9b35;
+  border-radius: 7px;
+  color: #4c5349;
+  font-size: 11px;
+  line-height: 1.8;
+}
+
+.setting-block {
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fcfdfa;
+}
+
+.setting-block-head {
+  position: relative;
+  margin-bottom: 14px;
+  padding-right: 78px;
+}
+
+.setting-block-head h3 {
+  margin: 0 0 5px;
+  font-size: 14px;
+}
+
+.setting-block-head p {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.inline-toggle {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+
+.setting-block .param-field {
+  margin-bottom: 18px;
+}
+
+.pick-field .series-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 9px;
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.pick-field .series-label b {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--acid);
+  font-size: 10px;
+}
+
+.pick-field .series-label small {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+/* サバイバーを一覧から複数選ぶチェックボックス群。 */
+.pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  max-height: 300px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+}
+
+.pick-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pick-grid label:hover {
+  background: #f5f8ee;
+}
+
+.pick-grid label.picked {
+  border-color: #9ca579;
+  background: #f0f5e0;
+  font-weight: 800;
+}
+
+.pick-grid input {
+  width: 15px;
+  min-height: 15px;
+  flex: 0 0 auto;
+  accent-color: var(--ink);
+}
+
+.clear-picks {
+  margin-top: 10px;
+}
+
+@media (max-width: 640px) {
+  .setting-block-head {
+    padding-right: 0;
+  }
+
+  .inline-toggle {
+    position: static;
+    margin-top: 10px;
+  }
+
+  .pick-grid {
+    grid-template-columns: 1fr 1fr;
+  }
 }

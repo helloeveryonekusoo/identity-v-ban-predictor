@@ -15,6 +15,11 @@ export { normalizeBans, banSignature } from "./stats";
 export type PredictionQuery = {
   map: string;
   bans: string[];
+  /**
+   * サバイバー側がBANしたハンター。一致度の計算には一切使わず、
+   * 予測が終わったあとに候補から取り除くためだけに使う。
+   */
+  hunterBans?: string[];
   /** 検索時点のシーズン。シーズン補正の基準に使う。 */
   season?: string;
 };
@@ -37,8 +42,8 @@ export type FactorContext = {
 
 /**
  * ファクターの評価結果。
- * add      … 基礎スコアへの加算（一致の強さ）
- * multiply … 合計スコアへの倍率（補正）
+ * add      … 一致度への加算（kind: "match" の要素だけが使う）
+ * multiply … 同じ一致度の中での倍率（kind: "adjust" の要素だけが使う）
  * exclude  … このデータを予測から除外する
  * note     … 採用理由として利用者へ表示する短い説明
  */
@@ -52,6 +57,10 @@ export type FactorResult = {
 /** 採用理由の表示用。小数は2桁までに丸め、加算値には符号を付ける。 */
 function round2(value: number) {
   return Math.round(value * 100) / 100;
+}
+
+function round1(value: number) {
+  return Math.round(value * 10) / 10;
 }
 
 function signed(value: number) {
@@ -83,16 +92,34 @@ export type FactorSeriesSpec = {
   labels: (settings: AppSettings) => string[];
 };
 
+/** 名称を複数選ばせる設定（例: 希少Ban扱いにするサバイバー）。 */
+export type FactorPickSpec = {
+  key: string;
+  label: string;
+  hint?: string;
+  /** 選択肢。マスターデータから引く。 */
+  options: (settings: AppSettings) => string[];
+};
+
 /**
- * 予測の評価要素。新しい要素を足すときは、このリストへ1件追加し
- * defaultPredictionConfig() に既定値を足すだけでよい（管理画面は自動生成）。
+ * 予測の評価要素。
+ *
+ * kind: "match"  … 一致度そのもの。マップとBANサバイバーだけがここに入る。
+ *                  順位はまずこの合計値（一致度）で決まり、件数では逆転しない。
+ * kind: "adjust" … 同じ一致度の中だけで効く補正。希少Ban・シーズンなど。
+ *                  一致度をまたいで順位を入れ替えることはない。
+ *
+ * 新しい要素を足すときは、このリストへ1件追加し defaultPredictionConfig() に
+ * 既定値を足すだけでよい（設定画面は自動生成される）。
  */
 export type PredictionFactor = {
   id: string;
   label: string;
   description: string;
+  kind: "match" | "adjust";
   params: FactorParamSpec[];
   series: FactorSeriesSpec[];
+  picks: FactorPickSpec[];
   score: (context: FactorContext) => FactorResult;
 };
 
@@ -102,6 +129,7 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
     label: "Ban一致",
     description:
       "検索条件と同じサバイバーがBANされているデータを高く評価します。BANの順番は問いません。",
+    kind: "match",
     params: [],
     series: [
       {
@@ -117,6 +145,7 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
           ),
       },
     ],
+    picks: [],
     score: ({ banMatchCount, config }) => {
       const add = config.series.weights?.[banMatchCount] ?? 0;
       return {
@@ -133,6 +162,7 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
     label: "マップ補正",
     description:
       "マップが一致したデータへ重みを加算します。マップは絞り込み条件ではなく、加点要素として働きます。",
+    kind: "match",
     params: [
       {
         key: "weight",
@@ -143,6 +173,7 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
       },
     ],
     series: [],
+    picks: [],
     score: ({ mapMatched, config }) => {
       if (!mapMatched) return { add: 0, note: "マップ不一致" };
       const add = config.params.weight ?? 0;
@@ -153,32 +184,36 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
     id: "rareBan",
     label: "希少Ban補正",
     description:
-      "BAN率が低いサバイバーほど特徴的な情報として、一致時の評価を引き上げます。倍率は最大値までの範囲で希少度に比例します。",
+      "「基本設定」で選んだサバイバーがBANされていたデータを、特徴的な情報として引き上げます。選んでいないサバイバーには補正が掛かりません。",
+    kind: "adjust",
     params: [
       {
-        key: "maxBonus",
-        label: "最大加算倍率",
+        key: "bonus",
+        label: "1人あたりの加算倍率",
         min: 0,
         max: 3,
         step: 0.05,
-        hint: "0.5 なら最大 1.5 倍",
+        hint: "0.5 なら1人一致で1.5倍、2人一致で2倍",
       },
     ],
     series: [],
-    score: ({ matchedBans, banRate, config }) => {
-      if (!matchedBans.length) return { multiply: 1 };
-      const rarity =
-        matchedBans.reduce(
-          (total, ban) => total + (1 - Math.min(1, banRate.get(ban) ?? 0)),
-          0,
-        ) / matchedBans.length;
-      const multiply = 1 + (config.params.maxBonus ?? 0) * rarity;
+    picks: [
+      {
+        key: "survivors",
+        label: "希少Ban扱いにするサバイバー",
+        hint: "検索条件と一致したBANのうち、ここで選んだサバイバーにだけ補正が掛かります。",
+        options: (settings) => settings.survivors,
+      },
+    ],
+    score: ({ matchedBans, config }) => {
+      const rare = new Set(config.picks.survivors ?? []);
+      if (!rare.size) return { multiply: 1 };
+      const hits = matchedBans.filter((ban) => rare.has(ban));
+      if (!hits.length) return { multiply: 1 };
+      const multiply = 1 + (config.params.bonus ?? 0) * hits.length;
       return {
         multiply,
-        note:
-          Math.abs(multiply - 1) < 0.005
-            ? undefined
-            : `希少Ban補正 ${times(multiply)}`,
+        note: `希少Ban補正（${hits.join("・")}）${times(multiply)}`,
       };
     },
   },
@@ -187,6 +222,7 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
     label: "シーズン補正",
     description:
       "新しいシーズンのデータを優先します。倍率が 0 のシーズンはデータが使われません。",
+    kind: "adjust",
     params: [],
     series: [
       {
@@ -204,6 +240,7 @@ export const PREDICTION_FACTORS: PredictionFactor[] = [
           }),
       },
     ],
+    picks: [],
     score: ({ seasonAge, config }) => {
       const multiply = config.series.weights?.[seasonAge] ?? 1;
       return {
@@ -221,6 +258,7 @@ const EMPTY_FACTOR_CONFIG: FactorConfig = {
   enabled: false,
   params: {},
   series: {},
+  picks: {},
 };
 
 function seasonAgeOf(season: string, settings: AppSettings) {
@@ -256,49 +294,17 @@ function toPercentages(values: number[]): number[] {
 
 type ScoredRecord = {
   record: MatchRecord;
-  score: number;
-  /** ファクターによる加算の合計。0 なら「類似していない」データ。 */
-  relevance: number;
+  /** マップとBANだけで決まる一致度。順位はまずこの値で決まる。 */
+  matchValue: number;
+  /** 同じ一致度の中だけで効く補正倍率。 */
+  multiplier: number;
+  /** 一致度 × 補正。同じ一致度の中での比較に使う。 */
+  weight: number;
   banMatchCount: number;
   mapMatched: boolean;
-  /** 各ファクターが返した採用理由。 */
   notes: string[];
+  excluded: boolean;
 };
-
-function round1(value: number) {
-  return Math.round(value * 10) / 10;
-}
-
-/**
- * ハンター1体ぶんの「採用されたデータ」一覧を、影響の大きい順に組み立てる。
- * usingFallback（類似データ無し）のときは、一致ではなく全体傾向として使われた旨を示す。
- */
-function buildContributions(
-  items: ScoredRecord[],
-  totalScore: number,
-  usingFallback: boolean,
-): PredictionContribution[] {
-  return [...items]
-    .sort(
-      (a, b) =>
-        b.score - a.score ||
-        b.banMatchCount - a.banMatchCount ||
-        Number(b.mapMatched) - Number(a.mapMatched),
-    )
-    .map((item) => {
-      const notes = usingFallback
-        ? ["全体傾向として使用", ...item.notes]
-        : item.notes;
-      return {
-        record: item.record,
-        score: round1(item.score),
-        share: totalScore > 0 ? round1((item.score / totalScore) * 100) : 0,
-        banMatchCount: item.banMatchCount,
-        mapMatched: item.mapMatched,
-        reason: notes.length ? notes.join(" / ") : "基礎スコアのみ",
-      };
-    });
-}
 
 function scoreRecord(
   record: MatchRecord,
@@ -323,8 +329,8 @@ function scoreRecord(
     settings,
   };
 
-  let add = 0;
-  let multiply = 1;
+  let matchValue = 0;
+  let multiplier = 1;
   let excluded = false;
   const notes: string[] = [];
 
@@ -333,32 +339,82 @@ function scoreRecord(
     if (!factorConfig.enabled) return;
     const result = factor.score({ ...context, config: factorConfig });
     if (result.exclude) excluded = true;
-    add += result.add ?? 0;
-    multiply *= result.multiply ?? 1;
+    // 一致度と補正は別々に積む。補正が一致度をまたいで順位を変えることはない。
+    if (factor.kind === "match") matchValue += result.add ?? 0;
+    else multiplier *= result.multiply ?? 1;
     if (result.note) notes.push(result.note);
   });
 
-  const score = excluded
-    ? 0
-    : Math.max(0, (config.baseWeight + add) * multiply);
+  matchValue = Math.max(0, matchValue);
+  multiplier = Math.max(0, multiplier);
 
   return {
     record,
-    score,
-    relevance: excluded ? 0 : add,
+    matchValue,
+    multiplier,
+    weight: (config.baseWeight + matchValue) * multiplier,
     banMatchCount: matchedBans.length,
     mapMatched,
     notes,
+    excluded,
   };
 }
 
 /**
- * マップでは一切絞り込まず、登録されている全データを対象にスコアリングし、
- * ハンターごとの予測率（合計100%）を返す。
- * マップは検索条件ではなく加点要素として扱うため、マップが違うデータでも
- * BANが一致していれば予測に採用される。
- * BANを指定した検索では、BANが1人も一致しないデータは評価対象外とする。
- * 完全一致データが無い場合も、一致度の低いデータを重み付けして必ず結果を返す。
+ * 同じ一致度の中で件数がどれだけ効くかの上限。
+ * 「一致度の高いハンターが、件数の多い低一致度のハンターに逆転されない」ことを
+ * 保証するため、隣り合う一致度の比率より必ず小さい値へ丸める。
+ */
+function safeCountWeight(matchValues: number[], config: { baseWeight: number; countWeight: number }) {
+  const distinct = [...new Set(matchValues)].sort((a, b) => b - a);
+  let limit = Infinity;
+  for (let i = 1; i < distinct.length; i += 1) {
+    const upper = config.baseWeight + distinct[i - 1];
+    const lower = config.baseWeight + distinct[i];
+    if (lower > 0) limit = Math.min(limit, upper / lower - 1);
+  }
+  const cap = Number.isFinite(limit) ? Math.max(0, limit * 0.9) : Infinity;
+  return Math.min(Math.max(0, config.countWeight), cap);
+}
+
+function buildContributions(
+  items: ScoredRecord[],
+  totalWeight: number,
+  usingFallback: boolean,
+): PredictionContribution[] {
+  return [...items]
+    .sort(
+      (a, b) =>
+        b.weight - a.weight ||
+        b.banMatchCount - a.banMatchCount ||
+        Number(b.mapMatched) - Number(a.mapMatched),
+    )
+    .map((item) => {
+      const notes = usingFallback
+        ? ["全体傾向として使用", ...item.notes]
+        : item.notes;
+      return {
+        record: item.record,
+        score: round1(item.weight),
+        share: totalWeight > 0 ? round1((item.weight / totalWeight) * 100) : 0,
+        banMatchCount: item.banMatchCount,
+        mapMatched: item.mapMatched,
+        reason: notes.length ? notes.join(" / ") : "基礎スコアのみ",
+      };
+    });
+}
+
+/**
+ * マップでは絞り込まず、登録されている全データを対象にスコアリングする。
+ *
+ * 順位の決め方は「一致度 ＞ 件数」。
+ * 1. 各データの一致度（マップ＋BANサバイバーのみ）を求める。
+ * 2. ハンターごとに、最も高い一致度のデータだけを採用する。
+ * 3. 同じ一致度の中でのみ、件数と補正（希少Ban・シーズン）で差をつける。
+ *    件数の影響は自動で上限が掛かるので、Ban2一致の大量データが
+ *    Ban3一致を追い抜くことはない。
+ * 4. ハンターBANで指定されたハンターを候補から完全に除外する。
+ * 5. 残ったハンターだけで予測率（合計100%）を計算し直す。
  */
 export function buildPrediction(
   records: MatchRecord[],
@@ -366,85 +422,137 @@ export function buildPrediction(
   settings: AppSettings,
   banRate: Map<string, number>,
 ): PredictionResult {
+  const bannedHunters = new Set(normalizeBans(query.hunterBans ?? []));
   const empty: PredictionResult = {
     rows: [],
     total: 0,
     exactCount: 0,
     basis: "データがありません",
     tiers: [],
+    excludedHunters: [],
   };
   if (!records.length) return empty;
 
   const queryBans = new Set(normalizeBans(query.bans));
-  // マップでの絞り込みは行わない。全データをスコアリングの対象にする。
   const scored = records.map((record) =>
     scoreRecord(record, query, settings, banRate, queryBans),
   );
 
   // BANを指定しているときは、BANが1人も一致しないデータを評価対象外にする。
-  // （マップだけが一致したデータがBAN1一致より上に来るのを防ぐ）
-  const matched = scored.filter(
+  const usable = scored.filter(
     (item) =>
-      item.relevance > 0 &&
-      item.score > 0 &&
+      !item.excluded &&
+      item.weight > 0 &&
+      item.matchValue > 0 &&
       (queryBans.size === 0 || item.banMatchCount > 0),
   );
-  let used = matched;
+  let pool = usable;
   let usingFallback = false;
 
-  if (!used.length) {
+  if (!pool.length) {
     // 類似データが1件も無いときは、全データの傾向から予測する。
     usingFallback = true;
-    used = scored.filter((item) => item.score > 0);
+    pool = scored.filter((item) => !item.excluded && item.weight > 0);
   }
-  if (!used.length) {
-    // 補正で全データのスコアが 0 になった場合は、均等重みで最低限の結果を返す。
+  if (!pool.length) {
     usingFallback = true;
-    used = scored.map((item) => ({ ...item, score: 1 }));
+    pool = scored.map((item) => ({ ...item, weight: 1, matchValue: 0 }));
   }
 
-  const byHunter = new Map<
-    string,
-    { score: number; count: number; items: ScoredRecord[] }
-  >();
-  used.forEach((item) => {
+  // ハンターごとに「最も高い一致度」を求め、その一致度のデータだけを採用する。
+  const byHunter = new Map<string, ScoredRecord[]>();
+  pool.forEach((item) => {
     const hunter = item.record.hunter;
-    if (!hunter) return;
-    const bucket = byHunter.get(hunter) ?? { score: 0, count: 0, items: [] };
-    bucket.score += item.score;
-    bucket.count += 1;
-    bucket.items.push(item);
-    byHunter.set(hunter, bucket);
+    if (!hunter || bannedHunters.has(hunter)) return;
+    const bucket = byHunter.get(hunter);
+    if (bucket) bucket.push(item);
+    else byHunter.set(hunter, [item]);
   });
 
-  if (!byHunter.size) return empty;
+  const excludedHunters = [...new Set(pool.map((item) => item.record.hunter))]
+    .filter((hunter) => hunter && bannedHunters.has(hunter))
+    .sort((a, b) => a.localeCompare(b, "ja"));
 
-  const entries = [...byHunter.entries()].sort(
-    (a, b) =>
-      b[1].score - a[1].score ||
-      b[1].count - a[1].count ||
-      a[0].localeCompare(b[0], "ja"),
+  if (!byHunter.size) {
+    return {
+      ...empty,
+      basis: bannedHunters.size
+        ? "BANしたハンター以外に候補がありません"
+        : empty.basis,
+      excludedHunters,
+    };
+  }
+
+  type Bucket = {
+    hunter: string;
+    matchValue: number;
+    items: ScoredRecord[];
+    support: number;
+  };
+
+  const buckets: Bucket[] = [...byHunter.entries()].map(([hunter, items]) => {
+    const matchValue = Math.max(...items.map((item) => item.matchValue));
+    const best = items.filter((item) => item.matchValue === matchValue);
+    return {
+      hunter,
+      matchValue,
+      items: best,
+      support: best.reduce((total, item) => total + item.weight, 0),
+    };
+  });
+
+  const countWeight = safeCountWeight(
+    buckets.map((bucket) => bucket.matchValue),
+    settings.prediction,
   );
-  const percentages = toPercentages(entries.map(([, value]) => value.score));
 
-  const rows: PredictionRow[] = entries.map(([hunter, value], index) => ({
-    hunter,
-    count: value.count,
-    score: round1(value.score),
+  const scoreOf = (bucket: Bucket) => {
+    const tierScore = settings.prediction.baseWeight + bucket.matchValue;
+    if (tierScore <= 0) return 0;
+    // support（件数 × 補正）が増えるほど 0 → countWeight へ近づく。
+    // 上限が countWeight なので、一致度の順位を追い越すことはない。
+    const boost = countWeight * (bucket.support / (bucket.support + tierScore));
+    return tierScore * (1 + boost);
+  };
+
+  const ranked = buckets
+    .map((bucket) => ({ bucket, score: scoreOf(bucket) }))
+    .sort(
+      (a, b) =>
+        b.bucket.matchValue - a.bucket.matchValue ||
+        b.score - a.score ||
+        b.bucket.items.length - a.bucket.items.length ||
+        a.bucket.hunter.localeCompare(b.bucket.hunter, "ja"),
+    );
+
+  const percentages = toPercentages(ranked.map((entry) => entry.score));
+
+  const rows: PredictionRow[] = ranked.map((entry, index) => ({
+    hunter: entry.bucket.hunter,
+    count: entry.bucket.items.length,
+    score: round1(entry.score),
+    matchValue: round1(entry.bucket.matchValue),
+    matchLabel: tierLabel(
+      entry.bucket.items[0].banMatchCount,
+      entry.bucket.items[0].mapMatched,
+      !usingFallback,
+    ),
     probability: percentages[index],
-    contributions: buildContributions(value.items, value.score, usingFallback),
+    contributions: buildContributions(
+      entry.bucket.items,
+      entry.bucket.support,
+      usingFallback,
+    ),
   }));
+
+  const used = ranked.flatMap((entry) => entry.bucket.items);
 
   const tierMap = new Map<string, PredictionTier>();
   used.forEach((item) => {
-    const label = tierLabel(
-      item.banMatchCount,
-      item.mapMatched,
-      !usingFallback && item.relevance > 0,
-    );
+    const label = tierLabel(item.banMatchCount, item.mapMatched, !usingFallback);
     const tier = tierMap.get(label) ?? { label, count: 0, score: 0 };
     tier.count += 1;
-    tier.score += item.score;
+    tier.score += item.weight;
     tierMap.set(label, tier);
   });
   const tiers = [...tierMap.values()].sort(
@@ -463,7 +571,14 @@ export function buildPrediction(
     ? "類似データが無いため、全データの傾向から予測しています"
     : exactCount > 0
       ? `完全一致 ${exactCount}件を中心に予測しています`
-      : `${tiers[0]?.label ?? "類似データ"}を中心に予測しています`;
+      : `${rows[0]?.matchLabel ?? "類似データ"}を最上位として予測しています`;
 
-  return { rows, total: used.length, exactCount, basis, tiers };
+  return {
+    rows,
+    total: used.length,
+    exactCount,
+    basis,
+    tiers,
+    excludedHunters,
+  };
 }

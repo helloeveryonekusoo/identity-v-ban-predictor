@@ -17,8 +17,14 @@ service cloud.firestore {
       allow read, create, update, delete: if signedIn();
     }
 
+    // マスターデータ（サバイバー・ハンター・マップ・シーズン）は全員で共有する。
     match /settings/global {
       allow read, write: if signedIn();
+    }
+
+    // 基本設定・予測の重み・希少Ban・既定ハンターBANは本人だけのもの。
+    match /userSettings/{userId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
     }
   }
 }
