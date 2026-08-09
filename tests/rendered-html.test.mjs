@@ -18,7 +18,7 @@ test("ships the BAN prediction product metadata", async () => {
   assert.match(page, /使用データ/);
   assert.match(page, /アカウント作成/);
   assert.match(page, /データ追加/);
-  assert.match(page, /登録データの削除/);
+  assert.match(page, /登録データの修正・削除/);
   assert.match(page, /マスターデータ更新/);
   assert.match(css, /--acid:\s*#d9ff43/);
   assert.match(packageJson, /"firebase"/);

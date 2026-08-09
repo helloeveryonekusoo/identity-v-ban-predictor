@@ -14,6 +14,17 @@ export type MatchRecord = {
   season: string;
 };
 
+/** 新規登録・修正で書き込む試合データの中身（登録者・登録日時は含まない）。 */
+export type MatchPayload = {
+  map: string;
+  bans: string[];
+  ban1: string;
+  ban2: string;
+  ban3: string;
+  hunter: string;
+  season: string;
+};
+
 /** マスターデータの種別。追加時はここと MASTER_LABELS を増やすだけでよい。 */
 export type MasterKind = "survivors" | "hunters" | "maps" | "seasons";
 

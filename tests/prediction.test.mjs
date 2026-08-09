@@ -563,6 +563,70 @@ describe("集計", () => {
   });
 });
 
+describe("登録・修正の保存内容", () => {
+  it("BAN人数が3未満でも ban1〜ban3 を必ず埋める", () => {
+    const payload = records.buildMatchPayload({
+      map: "軍需工場",
+      bans: ["祭司"],
+      hunter: "イタカ",
+      season: "S43",
+      banSlots: 1,
+    });
+    assert.deepEqual(payload.bans, ["祭司"]);
+    assert.equal(payload.ban1, "祭司");
+    assert.equal(payload.ban2, "BANなし");
+    assert.equal(payload.ban3, "BANなし");
+  });
+
+  it("BAN人数を超える入力は切り詰める", () => {
+    const payload = records.buildMatchPayload({
+      map: "湖景村",
+      bans: ["祭司", "空軍", "医師", "傭兵"],
+      hunter: "漁師",
+      season: "S41",
+      banSlots: 3,
+    });
+    assert.deepEqual(payload.bans, ["祭司", "空軍", "医師"]);
+  });
+
+  it("入力の不備を1件ずつ知らせる", () => {
+    const base = { map: "軍需工場", bans: ["祭司"], hunter: "イタカ" };
+    assert.equal(records.validateMatchInput(base), null);
+    assert.match(records.validateMatchInput({ ...base, map: "" }), /マップ/);
+    assert.match(records.validateMatchInput({ ...base, hunter: "" }), /ハンター/);
+    assert.match(
+      records.validateMatchInput({ ...base, bans: ["祭司", "祭司"] }),
+      /重複/,
+    );
+    // BANなしは何個あっても重複扱いにしない。
+    assert.equal(
+      records.validateMatchInput({ ...base, bans: ["BANなし", "BANなし"] }),
+      null,
+    );
+  });
+
+  it("内容が変わっていない修正を検出する", () => {
+    const record = match("1", "軍需工場", ["祭司", "空軍", "BANなし"], "イタカ", "S43");
+    const same = records.buildMatchPayload({
+      map: "軍需工場",
+      bans: ["祭司", "空軍", "BANなし"],
+      hunter: "イタカ",
+      season: "S43",
+      banSlots: 3,
+    });
+    assert.equal(records.isSameMatch(record, same), true);
+
+    const changed = records.buildMatchPayload({
+      map: "軍需工場",
+      bans: ["祭司", "空軍", "BANなし"],
+      hunter: "女王蜂",
+      season: "S43",
+      banSlots: 3,
+    });
+    assert.equal(records.isSameMatch(record, changed), false);
+  });
+});
+
 describe("名称変更", () => {
   it("登録済みデータの全項目へ伝播する", () => {
     let plan = records.emptyRenamePlan();
