@@ -1,5 +1,62 @@
 import { BAN_NONE } from "./constants";
-import type { MasterKind, MatchRecord, RenamePlan } from "./types";
+import type {
+  MasterKind,
+  MatchPayload,
+  MatchRecord,
+  RenamePlan,
+} from "./types";
+
+/**
+ * 新規登録と修正で共通の保存内容を組み立てる。
+ * ban1〜ban3 は集計・検索の互換性のため、BAN人数が3未満でも必ず埋める。
+ */
+export function buildMatchPayload(input: {
+  map: string;
+  bans: string[];
+  hunter: string;
+  season: string;
+  banSlots: number;
+}): MatchPayload {
+  const padded = Array.from(
+    { length: Math.max(3, input.banSlots) },
+    (_, index) => input.bans[index] ?? BAN_NONE,
+  );
+  return {
+    map: input.map,
+    bans: padded.slice(0, input.banSlots),
+    ban1: padded[0],
+    ban2: padded[1],
+    ban3: padded[2],
+    hunter: input.hunter,
+    season: input.season,
+  };
+}
+
+/** 入力の不備を1件だけ日本語で返す。問題なければ null。 */
+export function validateMatchInput(input: {
+  map: string;
+  bans: string[];
+  hunter: string;
+}): string | null {
+  if (!input.map) return "マップを選択してください";
+  if (!input.hunter) return "実際にピックされたハンターを選択してください";
+  const active = input.bans.filter((ban) => ban && ban !== BAN_NONE);
+  if (new Set(active).size !== active.length) {
+    return "同じサバイバーが重複しています";
+  }
+  return null;
+}
+
+/** 保存内容が元データと同じなら true（無駄な書き込みを避ける）。 */
+export function isSameMatch(record: MatchRecord, payload: MatchPayload) {
+  return (
+    record.map === payload.map &&
+    record.hunter === payload.hunter &&
+    record.season === payload.season &&
+    record.bans.length === payload.bans.length &&
+    record.bans.every((ban, index) => ban === payload.bans[index])
+  );
+}
 
 export function emptyRenamePlan(): RenamePlan {
   return { survivors: {}, hunters: {}, maps: {}, seasons: {} };

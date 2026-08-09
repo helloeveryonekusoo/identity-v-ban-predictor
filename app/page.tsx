@@ -18,6 +18,7 @@ import {
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
   writeBatch,
   type Firestore,
@@ -52,12 +53,15 @@ import { PREDICTION_FACTORS, buildPrediction } from "./prediction";
 import {
   activeRenames,
   applyRenamesToRecords,
+  buildMatchPayload,
   chunk,
   emptyRenamePlan,
   hasRenames,
+  isSameMatch,
   planRename,
   renameCount,
   renameFieldsForRecord,
+  validateMatchInput,
 } from "./records";
 import {
   EMPTY_RECORD_QUERY,
@@ -88,6 +92,14 @@ import type {
 } from "./types";
 
 const RECORD_LIMIT = 5000;
+
+/** 修正フォームが扱う編集内容。登録者・登録日時は変更しない。 */
+type MatchEditInput = {
+  map: string;
+  bans: string[];
+  hunter: string;
+  season: string;
+};
 
 const emptyPrediction: PredictionResult = {
   rows: [],
@@ -415,25 +427,18 @@ export default function Home() {
     selectedBans: string[],
     hunter: string,
   ) => {
-    const uniqueBanCount = normalizeBans(selectedBans).length;
-    const activeBanCount = selectedBans.filter((ban) => ban !== BAN_NONE).length;
-    if (!map || !hunter || uniqueBanCount !== activeBanCount) {
-      notify("マップ・BAN・ハンターを確認してください");
+    const problem = validateMatchInput({ map, bans: selectedBans, hunter });
+    if (problem) {
+      notify(problem);
       return false;
     }
-    const padded = Array.from(
-      { length: Math.max(3, settings.banSlots) },
-      (_, index) => selectedBans[index] ?? BAN_NONE,
-    );
-    const payload = {
+    const payload = buildMatchPayload({
       map,
-      bans: padded.slice(0, settings.banSlots),
-      ban1: padded[0],
-      ban2: padded[1],
-      ban3: padded[2],
+      bans: selectedBans,
       hunter,
       season: settings.currentSeason,
-    };
+      banSlots: settings.banSlots,
+    });
     setBusy(true);
     try {
       if (demoMode || !services || !user) {
@@ -506,6 +511,41 @@ export default function Home() {
       ),
     [allRecords],
   );
+
+  /** 登録済みデータ1件を書き換える。登録者と登録日時はそのまま残す。 */
+  const updateRecord = async (record: MatchRecord, input: MatchEditInput) => {
+    const problem = validateMatchInput(input);
+    if (problem) {
+      notify(problem);
+      return false;
+    }
+    const payload = buildMatchPayload({ ...input, banSlots: settings.banSlots });
+    if (isSameMatch(record, payload)) {
+      notify("変更はありません");
+      return true;
+    }
+    setBusy(true);
+    try {
+      if (!demoMode && services) {
+        await updateDoc(doc(services.db, "matches", record.id), payload);
+      }
+      setAllRecords((records) =>
+        records.map((item) =>
+          item.id === record.id ? { ...item, ...payload } : item,
+        ),
+      );
+      // 内容が変わったので、表示中の予測は作り直しになる。
+      setPrediction(emptyPrediction);
+      setHasSearched(false);
+      notify("データを修正しました");
+      return true;
+    } catch {
+      notify("修正に失敗しました");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const deleteRecords = async (ids: Set<string>) => {
     if (!ids.size) {
@@ -687,10 +727,13 @@ export default function Home() {
         {view === "delete" && (
           <DeleteView
             records={sortedRecords}
+            settings={settings}
+            survivorOptions={survivorOptions}
             seasons={seasonOptions}
             registrants={registrants}
             hunters={hunterOptions}
             onDelete={deleteRecords}
+            onUpdate={updateRecord}
             busy={busy}
             onBack={() => setView("main")}
           />
@@ -723,7 +766,7 @@ export default function Home() {
           className={view === "delete" ? "active" : ""}
           onClick={() => setView("delete")}
         >
-          <span>⌫</span>削除
+          <span>⌫</span>修正・削除
         </button>
         <button
           className={view === "update" ? "active" : ""}
@@ -1732,23 +1775,167 @@ function BrowseView({
   );
 }
 
+/**
+ * 登録済みデータ1件の修正フォーム。
+ * 変更できるのは試合の内容だけで、登録日時と登録ユーザーは元のまま残す。
+ */
+function EditDialog({
+  record,
+  settings,
+  survivorOptions,
+  seasons,
+  busy,
+  onSave,
+  onClose,
+}: {
+  record: MatchRecord;
+  settings: AppSettings;
+  survivorOptions: string[];
+  seasons: string[];
+  busy: boolean;
+  onSave: (record: MatchRecord, input: MatchEditInput) => Promise<boolean>;
+  onClose: () => void;
+}) {
+  const [map, setMap] = useState(record.map);
+  const [hunter, setHunter] = useState(record.hunter);
+  const [season, setSeason] = useState(record.season);
+  const [bans, setBans] = useState<string[]>(() =>
+    Array.from(
+      { length: settings.banSlots },
+      (_, index) => record.bans[index] ?? BAN_NONE,
+    ),
+  );
+
+  const problem = validateMatchInput({ map, bans, hunter });
+
+  // マスターから消えている名称でも、元の値は選べるようにしておく。
+  const withCurrent = (options: string[], current: string) =>
+    current && !options.includes(current) ? [current, ...options] : options;
+
+  return (
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="登録データの修正"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="modal">
+        <div className="modal-head">
+          <div>
+            <p className="eyebrow">EDIT RECORD</p>
+            <h2>登録データの修正</h2>
+          </div>
+          <button className="icon-button" aria-label="閉じる" onClick={onClose}>
+            ×
+          </button>
+        </div>
+
+        <p className="modal-meta">
+          {formatDateTime(record.registeredAt)} ／ {record.registeredByName}
+          <small>登録日時と登録ユーザーは変更されません。</small>
+        </p>
+
+        <div className="form-grid">
+          <label>
+            マップ
+            <select value={map} onChange={(event) => setMap(event.target.value)}>
+              <option value="">マップを選択</option>
+              {withCurrent(settings.maps, record.map).map((item) => (
+                <option key={item}>{item}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            シーズン
+            <select
+              value={season}
+              onChange={(event) => setSeason(event.target.value)}
+            >
+              {withCurrent(seasons, record.season).map((item) => (
+                <option key={item}>{item}</option>
+              ))}
+            </select>
+          </label>
+          {bans.map((ban, index) => (
+            <label key={index}>
+              BAN {index + 1}
+              <select
+                value={ban}
+                onChange={(event) => {
+                  const next = [...bans];
+                  next[index] = event.target.value;
+                  setBans(next);
+                }}
+              >
+                <option>{BAN_NONE}</option>
+                {withCurrent(survivorOptions, ban).map((item) => (
+                  <option key={item}>{item}</option>
+                ))}
+              </select>
+            </label>
+          ))}
+          <label className="wide">
+            実際にピックされたハンター
+            <select
+              value={hunter}
+              onChange={(event) => setHunter(event.target.value)}
+            >
+              <option value="">ハンターを選択</option>
+              {withCurrent(settings.hunters, record.hunter).map((item) => (
+                <option key={item}>{item}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {problem && <p className="form-error">{problem}</p>}
+
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={onClose}>
+            キャンセル
+          </button>
+          <button
+            className="primary-button"
+            disabled={Boolean(problem) || busy}
+            onClick={async () => {
+              if (await onSave(record, { map, bans, hunter, season })) onClose();
+            }}
+          >
+            {busy ? "保存中..." : "修正を保存"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DeleteView({
   records,
+  settings,
+  survivorOptions,
   seasons,
   registrants,
   hunters,
   onDelete,
+  onUpdate,
   busy,
   onBack,
 }: {
   records: MatchRecord[];
+  settings: AppSettings;
+  survivorOptions: string[];
   seasons: string[];
   registrants: { uid: string; name: string; count: number }[];
   hunters: string[];
   onDelete: (ids: Set<string>) => Promise<boolean>;
+  onUpdate: (record: MatchRecord, input: MatchEditInput) => Promise<boolean>;
   busy: boolean;
   onBack: () => void;
 }) {
+  const [editing, setEditing] = useState<MatchRecord | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // 検索し直したときは選択を解除し、表示中のデータだけが削除対象になるようにする。
   const { draft, setDraft, results, search, clear } = useRecordSearch(
@@ -1762,8 +1949,8 @@ function DeleteView({
   return (
     <AuxiliaryPage
       eyebrow="DATA CONTROL"
-      title="登録データの削除"
-      description="シーズン・登録ユーザー・ピックされたハンターで絞り込み、検索結果に表示されたデータだけをまとめて削除できます。"
+      title="登録データの修正・削除"
+      description="シーズン・登録ユーザー・ピックされたハンターで絞り込み、1件ずつ内容を修正したり、検索結果に表示されたデータをまとめて削除したりできます。"
       onBack={onBack}
     >
       <section className="panel delete-panel">
@@ -1799,6 +1986,7 @@ function DeleteView({
                 {RECORD_COLUMNS.map((column) => (
                   <th key={column}>{column}</th>
                 ))}
+                <th>修正</th>
               </tr>
             </thead>
             <tbody>
@@ -1819,11 +2007,19 @@ function DeleteView({
                   </td>
                   <td>{index + 1}</td>
                   <RecordCells record={record} />
+                  <td>
+                    <button
+                      className="row-edit-button"
+                      onClick={() => setEditing(record)}
+                    >
+                      修正
+                    </button>
+                  </td>
                 </tr>
               ))}
               {!results.length && (
                 <tr>
-                  <td colSpan={RECORD_COLUMNS.length + 2} className="empty-table">
+                  <td colSpan={RECORD_COLUMNS.length + 3} className="empty-table">
                     条件に一致するデータがありません
                   </td>
                 </tr>
@@ -1844,6 +2040,19 @@ function DeleteView({
           </button>
         </div>
       </section>
+
+      {editing && (
+        <EditDialog
+          key={editing.id}
+          record={editing}
+          settings={settings}
+          survivorOptions={survivorOptions}
+          seasons={seasons}
+          busy={busy}
+          onSave={onUpdate}
+          onClose={() => setEditing(null)}
+        />
+      )}
     </AuxiliaryPage>
   );
 }
