@@ -44,6 +44,7 @@ import {
   MASTER_LABELS,
   MAX_BAN_SLOTS,
   defaultPredictionConfig,
+  mergeSettings,
   normalizeSettings,
   resizeBanMatchWeights,
   splitSettings,
@@ -306,8 +307,7 @@ export default function Home() {
       });
       return;
     }
-    // マスターデータは全員で共有、それ以外の設定はユーザーごとに読み込む。
-    // ユーザー設定がまだ無いときは、共有ドキュメントの値をシステム既定として使う。
+    // マスターデータと予測設定は全員で共有、表示まわりはユーザーごとに読み込む。
     Promise.all([
       getDoc(doc(services.db, "settings", "global")),
       user
@@ -315,10 +315,12 @@ export default function Home() {
         : Promise.resolve(null),
     ])
       .then(([globalSnapshot, userSnapshot]) => {
-        const shared = globalSnapshot.exists() ? globalSnapshot.data() : {};
-        const personal =
-          userSnapshot && userSnapshot.exists() ? userSnapshot.data() : {};
-        setSettings(normalizeSettings({ ...shared, ...personal }));
+        setSettings(
+          mergeSettings(
+            globalSnapshot.exists() ? globalSnapshot.data() : {},
+            userSnapshot && userSnapshot.exists() ? userSnapshot.data() : {},
+          ),
+        );
       })
       .catch(() => notify("設定の読み込みに失敗しました"));
     queueMicrotask(() => void loadRecords());
@@ -595,7 +597,7 @@ export default function Home() {
             await batch.commit();
           }
         }
-        // マスターデータだけを共有ドキュメントへ、それ以外は本人のドキュメントへ。
+        // マスターと予測設定は共有ドキュメントへ、表示まわりは本人のドキュメントへ。
         const { shared, user: personal } = splitSettings(normalized);
         await setDoc(doc(services.db, "settings", "global"), shared);
         if (user) {
@@ -609,7 +611,7 @@ export default function Home() {
       notify(
         renames
           ? `設定を更新し、${renames}件の名称を登録データへ反映しました`
-          : "設定を更新しました（基本設定はあなた専用です）",
+          : "設定を更新しました（予測設定は全ユーザーへ反映されます）",
       );
       setView("main");
       return true;
@@ -2250,7 +2252,10 @@ function HunterBanDefaults({
   return (
     <div className="setting-block">
       <div className="setting-block-head">
-        <h3>デフォルトハンターBan設定</h3>
+        <h3>
+          デフォルトハンターBan設定
+          <span className="scope-tag personal">あなた専用</span>
+        </h3>
         <p>
           毎回よくBANするハンターを最大{HUNTER_BAN_SLOTS}体まで登録できます。
           検索画面を開いたときに、ここで登録したハンターが最初から選択された状態になります。
@@ -2317,7 +2322,10 @@ function RareBanSettings({
         return (
           <div key={factor.id} className="setting-block">
             <div className="setting-block-head">
-              <h3>{factor.label}設定</h3>
+              <h3>
+                {factor.label}設定
+                <span className="scope-tag shared">全員共有</span>
+              </h3>
               <p>{factor.description}</p>
               <label className="toggle inline-toggle">
                 <input
@@ -2443,7 +2451,13 @@ function PredictionEditor({
     <section className="panel prediction-editor">
       <div className="editor-head">
         <div>
-          <h2>予測設定</h2>
+          <h2>
+            予測設定
+            <span className="scope-tag shared">全員共有</span>
+          </h2>
+          <p className="shared-warning">
+            ここの設定は全ユーザー共通です。保存すると、他のユーザーの予測結果にもそのまま反映されます。
+          </p>
           <p>
             順位はまず<code>一致度（マップ＋BANサバイバー）</code>
             で決まります。ハンターごとに最も一致度の高いデータだけを採用し、
@@ -2513,6 +2527,10 @@ function PredictionEditor({
       {PREDICTION_FACTORS.map((factor) => {
         const factorConfig = config.factors[factor.id];
         if (!factorConfig) return null;
+        // 対象を選ぶ要素は基本設定側で扱うので、ここに出す項目が無いことがある。
+        const editableHere =
+          factor.series.length > 0 ||
+          (factor.picks.length === 0 && factor.params.length > 0);
         return (
           <article
             key={factor.id}
@@ -2529,7 +2547,7 @@ function PredictionEditor({
                 <p>{factor.description}</p>
                 {factor.picks.length > 0 && (
                   <p className="factor-link">
-                    対象の選択は「基本設定」タブで行います。
+                    対象と重みの設定は「基本設定」タブで行います。
                   </p>
                 )}
               </div>
@@ -2545,29 +2563,31 @@ function PredictionEditor({
               </label>
             </header>
 
-            {factorConfig.enabled && (
+            {factorConfig.enabled && editableHere && (
               <div className="factor-body">
-                {factor.params.map((spec) => (
-                  <label key={spec.key} className="param-field">
-                    {spec.label}
-                    <input
-                      type="number"
-                      min={spec.min}
-                      max={spec.max}
-                      step={spec.step}
-                      value={factorConfig.params[spec.key] ?? 0}
-                      onChange={(event) =>
-                        patchFactor(factor.id, {
-                          params: {
-                            ...factorConfig.params,
-                            [spec.key]: Number(event.target.value) || 0,
-                          },
-                        })
-                      }
-                    />
-                    {spec.hint && <small>{spec.hint}</small>}
-                  </label>
-                ))}
+                {/* 対象を選ぶ要素（希少Banなど）は、重みも含めて基本設定側で扱う。 */}
+                {factor.picks.length === 0 &&
+                  factor.params.map((spec) => (
+                    <label key={spec.key} className="param-field">
+                      {spec.label}
+                      <input
+                        type="number"
+                        min={spec.min}
+                        max={spec.max}
+                        step={spec.step}
+                        value={factorConfig.params[spec.key] ?? 0}
+                        onChange={(event) =>
+                          patchFactor(factor.id, {
+                            params: {
+                              ...factorConfig.params,
+                              [spec.key]: Number(event.target.value) || 0,
+                            },
+                          })
+                        }
+                      />
+                      {spec.hint && <small>{spec.hint}</small>}
+                    </label>
+                  ))}
 
                 {factor.series.map((spec) => {
                   const labels = spec.labels(draft);
@@ -2681,9 +2701,12 @@ function SettingsView({
         <section className="panel settings-summary wide-panel">
           <h2>基本設定</h2>
           <p className="personal-note">
-            この画面の設定は<b>あなた専用</b>として保存されます。
-            他のユーザーの予測や表示には影響しません。
-            サバイバー・ハンター・マップ・シーズンの一覧と試合データは全員で共有です。
+            <span className="scope-tag personal">あなた専用</span>
+            現在のシーズン・BANサバイバーの表示順・デフォルトハンターBanは、あなただけに保存されます。
+            <br />
+            <span className="scope-tag shared">全員共有</span>
+            BAN人数・希少Ban補正・予測設定タブの重みは<b>全ユーザー共通</b>です。
+            変更すると他のユーザーの予測結果にも反映されます。
           </p>
           <label>
             現在のシーズン

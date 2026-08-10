@@ -720,7 +720,7 @@ describe("設定の正規化", () => {
     assert.deepEqual(settings.defaultHunterBans, ["女王蜂", "破輪", "漁師"]);
   });
 
-  it("共有マスターとユーザー設定を分けて書き出す", () => {
+  it("共有設定とユーザー設定を分けて書き出す", () => {
     const settings = constants.normalizeSettings({
       ...constants.DEFAULT_SETTINGS,
       currentSeason: "S43",
@@ -730,25 +730,62 @@ describe("設定の正規化", () => {
     });
     const { shared, user } = constants.splitSettings(settings);
 
-    // 全員で共有するのはマスターデータだけ。
+    // マスターデータと予測設定は全員で共有する。
     assert.deepEqual(Object.keys(shared).sort(), [
       "banSlots",
       "hunters",
       "maps",
+      "prediction",
       "seasons",
       "survivors",
     ]);
-    // 基本設定・予測の重みは本人だけのもの。
+    // 表示まわりだけが本人のもの。
     assert.deepEqual(Object.keys(user).sort(), [
       "banOrderMode",
       "currentSeason",
       "defaultHunterBans",
-      "prediction",
     ]);
     assert.equal(user.banOrderMode, "banRate");
     assert.deepEqual(user.defaultHunterBans, ["歯医者"]);
-    assert.equal("prediction" in shared, false);
+    assert.equal("prediction" in user, false);
     assert.equal("survivors" in user, false);
+  });
+
+  it("予測設定は共有側を優先し、個人側の古い値で上書きされない", () => {
+    const shared = {
+      ...constants.DEFAULT_SETTINGS,
+      prediction: {
+        ...constants.defaultPredictionConfig(3),
+        baseWeight: 9,
+      },
+    };
+    const personal = {
+      currentSeason: "S43",
+      banOrderMode: "banRate",
+      defaultHunterBans: ["歯医者"],
+      // 旧バージョンで個人側へ保存されてしまった予測設定。
+      prediction: {
+        ...constants.defaultPredictionConfig(3),
+        baseWeight: 1,
+      },
+    };
+    const merged = constants.mergeSettings(shared, personal);
+    assert.equal(merged.prediction.baseWeight, 9);
+    // 個人設定は個人側が勝つ。
+    assert.equal(merged.banOrderMode, "banRate");
+    assert.deepEqual(merged.defaultHunterBans, ["歯医者"]);
+  });
+
+  it("共有側に予測設定が無い移行期は、個人側の値を引き継ぐ", () => {
+    const shared = { maps: ["軍需工場"], survivors: ["祭司"], hunters: ["イタカ"] };
+    const personal = {
+      prediction: {
+        ...constants.defaultPredictionConfig(3),
+        baseWeight: 7,
+      },
+    };
+    const merged = constants.mergeSettings(shared, personal);
+    assert.equal(merged.prediction.baseWeight, 7);
   });
 
   it("未知のファクター設定を失わない", () => {

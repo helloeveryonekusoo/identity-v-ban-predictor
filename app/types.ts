@@ -55,7 +55,11 @@ export type PredictionConfig = {
   factors: Record<string, FactorConfig>;
 };
 
-/** 全ユーザーで共有するマスターデータ。 */
+/**
+ * 全ユーザーで共有する設定。
+ * マスターデータに加え、予測アルゴリズムの重み（希少Ban対象を含む）も共有する。
+ * 誰か1人が調整すると、全員の予測結果へ反映される。
+ */
 export type SharedSettings = {
   maps: string[];
   survivors: string[];
@@ -63,6 +67,7 @@ export type SharedSettings = {
   /** 新しい順に並べる。index 0 が最新シーズン。 */
   seasons: string[];
   banSlots: number;
+  prediction: PredictionConfig;
 };
 
 /** ログイン中のユーザーだけに保存される設定。他ユーザーへは一切影響しない。 */
@@ -71,7 +76,6 @@ export type UserSettings = {
   banOrderMode: BanOrderMode;
   /** 検索画面を開いたときに最初から選ばれているハンターBAN（最大3体）。 */
   defaultHunterBans: string[];
-  prediction: PredictionConfig;
 };
 
 /** 画面が扱う設定の合成ビュー。保存時に共有ぶんとユーザーぶんへ分けて書き込む。 */
