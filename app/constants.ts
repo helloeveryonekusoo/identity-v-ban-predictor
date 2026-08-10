@@ -196,16 +196,16 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   currentSeason: DEFAULT_SEASON,
   banOrderMode: "registered",
   defaultHunterBans: [],
-  prediction: defaultPredictionConfig(3),
 };
 
-/** 全ユーザーで共有するマスターデータの初期値。 */
+/** 全ユーザーで共有する設定の初期値。 */
 export const DEFAULT_SHARED_SETTINGS: SharedSettings = {
   maps: [...DEFAULT_MAPS],
   survivors: [...DEFAULT_SURVIVORS],
   hunters: [...DEFAULT_HUNTERS],
   seasons: [DEFAULT_SEASON],
   banSlots: 3,
+  prediction: defaultPredictionConfig(3),
 };
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -349,7 +349,10 @@ export function normalizeSettings(raw: unknown): AppSettings {
   };
 }
 
-/** 保存時に、共有マスターとユーザー設定へ切り分ける。 */
+/**
+ * 保存時に、全員で共有する設定と本人だけの設定へ切り分ける。
+ * 予測アルゴリズムの重みは共有側なので、誰か1人の調整が全員へ反映される。
+ */
 export function splitSettings(settings: AppSettings): {
   shared: SharedSettings;
   user: UserSettings;
@@ -361,14 +364,30 @@ export function splitSettings(settings: AppSettings): {
       hunters: settings.hunters,
       seasons: settings.seasons,
       banSlots: settings.banSlots,
+      prediction: settings.prediction,
     },
     user: {
       currentSeason: settings.currentSeason,
       banOrderMode: settings.banOrderMode,
       defaultHunterBans: settings.defaultHunterBans,
-      prediction: settings.prediction,
     },
   };
+}
+
+/**
+ * 読み込み時の合成。共有設定を土台に、本人の設定を上書きする。
+ * 予測設定は必ず共有側を優先する（旧バージョンで個人側へ保存された値が
+ * 残っていても、共有の調整結果が勝つようにする）。
+ * 共有側にまだ予測設定が無い移行期だけ、本人の値を引き継ぐ。
+ */
+export function mergeSettings(shared: unknown, personal: unknown): AppSettings {
+  const sharedData = (shared ?? {}) as Record<string, unknown>;
+  const personalData = (personal ?? {}) as Record<string, unknown>;
+  return normalizeSettings({
+    ...sharedData,
+    ...personalData,
+    prediction: sharedData.prediction ?? personalData.prediction,
+  });
 }
 
 /** BAN人数を変えたときに、BAN一致数の重み配列を過不足なく合わせる。 */

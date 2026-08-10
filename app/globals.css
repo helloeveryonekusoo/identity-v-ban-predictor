@@ -2086,3 +2086,38 @@ th input {
     width: 100%;
   }
 }
+
+/* ---------- 設定の適用範囲（共有 / 個人）のラベル ---------- */
+
+.scope-tag {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+h2 .scope-tag,
+h3 .scope-tag {
+  margin: 0 0 0 8px;
+}
+
+.scope-tag.shared {
+  background: #f4e6c9;
+  color: #7a5a12;
+}
+
+.scope-tag.personal {
+  background: #e4ece1;
+  color: #3f5a3c;
+}
+
+.shared-warning {
+  margin: 8px 0 0 !important;
+  color: #7a5a12 !important;
+  font-weight: 700;
+}
