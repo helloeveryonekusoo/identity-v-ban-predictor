@@ -39,5 +39,16 @@ test("includes Firebase sharing rules, authentication, and web configuration", a
   assert.match(webConfig, /identity-v-ban-predictor-kuro/);
   assert.match(firebaseConfig, /"emailPassword": true/);
   assert.match(firebaseConfig, /"public": "firebase-dist"/);
+
+  // Firebase Hosting は _headers ファイルを読まないので、キャッシュ制御は
+  // firebase.json 側で持つ必要がある。既定の max-age=3600 のままだと、
+  // デプロイ後も最大1時間は古いHTML/JSが利用者へ配信されてしまう。
+  const headers = JSON.parse(firebaseConfig).hosting.headers ?? [];
+  const valueFor = (source) =>
+    headers
+      .find((entry) => entry.source === source)
+      ?.headers.find((header) => header.key === "Cache-Control")?.value ?? "";
+  assert.match(valueFor("**"), /no-cache/);
+  assert.match(valueFor("/assets/**"), /immutable/);
   assert.match(entry, /<Home \/>/);
 });
