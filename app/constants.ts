@@ -374,6 +374,31 @@ export function splitSettings(settings: AppSettings): {
   };
 }
 
+/** 設定値（数値・文字列・配列・マップだけ）の深い比較。 */
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((item, index) => deepEqual(item, b[index]));
+  }
+  if (typeof a !== "object" || typeof b !== "object" || !a || !b) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every((key) => deepEqual(left[key], right[key]));
+}
+
+/**
+ * 予測設定が編集されたかどうか。
+ * 共有設定なので、本人が触っていないときに書き込んで
+ * 他の人の調整を消してしまわないよう、保存前に確認する。
+ */
+export function isSamePrediction(a: PredictionConfig, b: PredictionConfig) {
+  return deepEqual(a, b);
+}
+
 /**
  * 読み込み時の合成。共有設定を土台に、本人の設定を上書きする。
  * 予測設定は必ず共有側を優先する（旧バージョンで個人側へ保存された値が

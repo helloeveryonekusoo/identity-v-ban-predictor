@@ -776,6 +776,32 @@ describe("設定の正規化", () => {
     assert.deepEqual(merged.defaultHunterBans, ["歯医者"]);
   });
 
+  it("予測設定を触ったかどうかを判定する", () => {
+    const base = constants.defaultPredictionConfig(3);
+    const copy = constants.defaultPredictionConfig(3);
+    assert.equal(constants.isSamePrediction(base, copy), true);
+
+    // Ban一致の重みを1つ変えただけでも「触った」と判定する。
+    const editedSeries = constants.defaultPredictionConfig(3);
+    editedSeries.factors.banMatch.series.weights[3] = 40;
+    assert.equal(constants.isSamePrediction(base, editedSeries), false);
+
+    // 希少Banの対象を選び直した場合も同じ。
+    const editedPicks = constants.defaultPredictionConfig(3);
+    editedPicks.factors.rareBan.picks.survivors = ["呪術師"];
+    assert.equal(constants.isSamePrediction(base, editedPicks), false);
+
+    // ON/OFF も対象。
+    const editedToggle = constants.defaultPredictionConfig(3);
+    editedToggle.factors.season.enabled = false;
+    assert.equal(constants.isSamePrediction(base, editedToggle), false);
+
+    // 基礎スコア・件数の影響度も対象。
+    const editedBase = constants.defaultPredictionConfig(3);
+    editedBase.baseWeight = 2;
+    assert.equal(constants.isSamePrediction(base, editedBase), false);
+  });
+
   it("共有側に予測設定が無い移行期は、個人側の値を引き継ぐ", () => {
     const shared = { maps: ["軍需工場"], survivors: ["祭司"], hunters: ["イタカ"] };
     const personal = {

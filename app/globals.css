@@ -2121,3 +2121,13 @@ h3 .scope-tag {
   color: #7a5a12 !important;
   font-weight: 700;
 }
+
+.shared-origin {
+  margin: 6px 0 0 !important;
+  padding: 8px 12px;
+  background: #f2f4ed;
+  border-radius: 7px;
+  color: #4c5349 !important;
+  font-size: 11px;
+  font-weight: 700;
+}
