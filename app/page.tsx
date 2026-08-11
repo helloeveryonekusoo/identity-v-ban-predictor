@@ -44,6 +44,7 @@ import {
   MASTER_LABELS,
   MAX_BAN_SLOTS,
   defaultPredictionConfig,
+  isSamePrediction,
   mergeSettings,
   normalizeSettings,
   resizeBanMatchWeights,
@@ -84,6 +85,7 @@ import type {
   FactorConfig,
   MasterKind,
   MatchRecord,
+  PredictionConfig,
   PredictionResult,
   PredictionRow,
   RankingResult,
@@ -255,6 +257,16 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState("");
 
+  // 共有されている予測設定の「読み込んだ時点の中身」と「誰がいつ保存したか」。
+  // 触っていない予測設定を上書きしないための判定と、画面表示に使う。
+  const [loadedPrediction, setLoadedPrediction] = useState<PredictionConfig>(
+    DEFAULT_SETTINGS.prediction,
+  );
+  const [sharedMeta, setSharedMeta] = useState<{
+    byName: string;
+    at: Date | null;
+  }>({ byName: "", at: null });
+
   const signedIn = Boolean(user || demoMode);
   const displayName =
     user?.displayName || user?.email?.split("@")[0] || (demoMode ? "デモユーザー" : "");
@@ -315,12 +327,20 @@ export default function Home() {
         : Promise.resolve(null),
     ])
       .then(([globalSnapshot, userSnapshot]) => {
-        setSettings(
-          mergeSettings(
-            globalSnapshot.exists() ? globalSnapshot.data() : {},
-            userSnapshot && userSnapshot.exists() ? userSnapshot.data() : {},
-          ),
+        const globalData = globalSnapshot.exists() ? globalSnapshot.data() : {};
+        const merged = mergeSettings(
+          globalData,
+          userSnapshot && userSnapshot.exists() ? userSnapshot.data() : {},
         );
+        setSettings(merged);
+        setLoadedPrediction(merged.prediction);
+        setSharedMeta({
+          byName: String(globalData.predictionUpdatedByName ?? ""),
+          at: toDate(
+            (globalData.predictionUpdatedAt as MatchRecord["registeredAt"]) ??
+              null,
+          ),
+        });
       })
       .catch(() => notify("設定の読み込みに失敗しました"));
     queueMicrotask(() => void loadRecords());
@@ -599,10 +619,51 @@ export default function Home() {
         }
         // マスターと予測設定は共有ドキュメントへ、表示まわりは本人のドキュメントへ。
         const { shared, user: personal } = splitSettings(normalized);
-        await setDoc(doc(services.db, "settings", "global"), shared);
+        const globalRef = doc(services.db, "settings", "global");
+
+        // 予測設定は全員共有なので、本人が触っていないときは書き換えない。
+        // （基本設定だけを保存した人が、他の人の調整を消してしまうのを防ぐ）
+        const edited = !isSamePrediction(normalized.prediction, loadedPrediction);
+        const remote = await getDoc(globalRef);
+        const remotePrediction = remote.exists()
+          ? (remote.data().prediction as PredictionConfig | undefined)
+          : undefined;
+
+        const payload: Record<string, unknown> = { ...shared };
+        if (edited) {
+          payload.predictionUpdatedByName = displayName;
+          payload.predictionUpdatedAt = serverTimestamp();
+        } else {
+          payload.prediction = remotePrediction ?? shared.prediction;
+          if (remote.exists()) {
+            payload.predictionUpdatedByName =
+              remote.data().predictionUpdatedByName ?? null;
+            payload.predictionUpdatedAt =
+              remote.data().predictionUpdatedAt ?? null;
+          }
+        }
+
+        await setDoc(globalRef, payload);
         if (user) {
           await setDoc(doc(services.db, "userSettings", user.uid), personal);
         }
+
+        // 画面の値も、実際に保存された内容へ合わせる。
+        if (!edited && remotePrediction) {
+          normalized.prediction = normalizeSettings({
+            ...normalized,
+            prediction: remotePrediction,
+          }).prediction;
+        }
+        setLoadedPrediction(normalized.prediction);
+        setSharedMeta({
+          byName: edited
+            ? displayName
+            : ((remote.exists()
+                ? (remote.data().predictionUpdatedByName as string)
+                : "") ?? ""),
+          at: edited ? new Date() : sharedMeta.at,
+        });
       }
       setAllRecords((records) => applyRenamesToRecords(records, plan));
       setSettings(normalized);
@@ -744,6 +805,7 @@ export default function Home() {
           <SettingsView
             settings={settings}
             records={allRecords}
+            sharedMeta={sharedMeta}
             busy={busy}
             onSave={saveSettings}
             onBack={() => setView("main")}
@@ -2428,9 +2490,11 @@ function RareBanSettings({
 function PredictionEditor({
   draft,
   setDraft,
+  sharedMeta,
 }: {
   draft: AppSettings;
   setDraft: (value: AppSettings) => void;
+  sharedMeta: { byName: string; at: Date | null };
 }) {
   const config = draft.prediction;
 
@@ -2457,6 +2521,13 @@ function PredictionEditor({
           </h2>
           <p className="shared-warning">
             ここの設定は全ユーザー共通です。保存すると、他のユーザーの予測結果にもそのまま反映されます。
+          </p>
+          <p className="shared-origin">
+            {sharedMeta.byName
+              ? `現在の設定は ${sharedMeta.byName} が${
+                  sharedMeta.at ? ` ${formatDateTime(sharedMeta.at)} に` : ""
+                }保存したものです`
+              : "まだ誰も共有設定を保存していません（各自の設定が使われています）"}
           </p>
           <p>
             順位はまず<code>一致度（マップ＋BANサバイバー）</code>
@@ -2637,12 +2708,14 @@ function PredictionEditor({
 function SettingsView({
   settings,
   records,
+  sharedMeta,
   busy,
   onSave,
   onBack,
 }: {
   settings: AppSettings;
   records: MatchRecord[];
+  sharedMeta: { byName: string; at: Date | null };
   busy: boolean;
   onSave: (settings: AppSettings, plan: RenamePlan) => Promise<boolean>;
   onBack: () => void;
@@ -2770,7 +2843,11 @@ function SettingsView({
       )}
 
       {section === "prediction" && (
-        <PredictionEditor draft={draft} setDraft={setDraft} />
+        <PredictionEditor
+          draft={draft}
+          setDraft={setDraft}
+          sharedMeta={sharedMeta}
+        />
       )}
 
       {section === "master" && (
